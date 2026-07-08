@@ -1,0 +1,13 @@
+n=0
+task0: 30.0%  drift 0.941
+task1: 45.0%  drift 0.953
+task2: 45.0%  drift 0.955
+task3: 95.0%  drift 0.965
+task4: 0.0%  drift 0.936
+task5: 25.0%  drift 0.929
+task6: 40.0%  drift 0.939
+task7: 50.0%  drift 0.959
+task8: 55.0%  drift 0.951
+task9: 5.0%  drift 0.944
+mean: 39.0%
+mean_drift: 0.947

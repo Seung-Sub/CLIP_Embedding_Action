@@ -1,0 +1,44 @@
+# Phase 2 (LIBERO) — 대조군: 손목캠 토큰 제외 (그 외 전부 기본 레시피와 동일)
+# phase1은 베이스라인(state_cond 그대로) 그대로 재사용 — "손목캠 유무" 단일 변수만 격리.
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  # wrist_camera 없음 — 손목캠 자체를 로더에서 안 씀
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: false           # ★손목캠 토큰 제외 (4토큰: z_prev,z_cur,a_emb,lang)
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_nowrist.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_nowrist}

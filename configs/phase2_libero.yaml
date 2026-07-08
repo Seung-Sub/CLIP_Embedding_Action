@@ -1,0 +1,45 @@
+# Phase 2 (LIBERO 트랙) — ★기본 = SOTA: flow(past) + 손목캠 + d1536 (캠페인 승자)
+# 근거: Spatial 80.0 / Object 85.7 / Goal 80.0 (시드3 평균, 기준 36.5/35/18)
+# 베이스라인(mlp)과 비교하려면 configs/phase2_libero_mlp.yaml 사용.
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb  # ★손목캠 토큰 (+26pp) — module.wrist_token과 세트
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+
+module:
+  name: flow                   # ★생성형 헤드 (mlp 대비 +29pp) — CFM+FLD
+  flow_source: past            # 수송 출발점 = g(A_past) (A2A식) — noise/vision 대비 일관 승
+  flow_steps: 6                # Euler 적분 (12 무이득)
+  source_noise: 0.1
+  d_model: 1536                # ★용량 (1024 대비 +6pp, 2048은 포화)
+  layers: 4                    # v_net 잔차블록
+  ctx_layers: 2                # ctx 인코더 블록 (4는 무이득)
+  lang_token: true             # 멀티태스크 언어 조건화 (필수)
+  wrist_token: true            # ★손목캠 5번째 토큰
+
+loss:
+  lat: 0.5                     # flow에선 CFM 가중 (1.0은 무이득)
+  act: 1.0                     # FLD 디코딩 액션 L1
+  wm: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2                      # 캠페인 승자 시드 (주의: 시드 분산 큼 — 최종 선택은 폐루프로)
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_fm.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_fm}

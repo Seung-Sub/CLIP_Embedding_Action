@@ -1,0 +1,26 @@
+# conda env "clip_libero" — LIBERO 트랙 (학습 로더 + 폐루프 평가)
+#
+#   conda env create -f environment_libero.yml
+#   conda activate clip_libero
+#
+# libero는 HuggingFace 재배포판(pypi 'libero', lerobot-libero) 사용 —
+# 공식 레포의 2022년 의존성 핀 문제를 회피. robosuite==1.4.0은 패키지가 강제.
+name: clip_libero
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch                      # cu128 (Blackwell)
+      - torchvision
+      - transformers               # CLIP ViT-L/14
+      - huggingface_hub
+      - libero                     # LIBERO 벤치마크 (HF 재배포; assets는 첫 실행 시 HF Hub 자동 다운로드)
+      - mujoco==3.3.2              # ★ 검증 조합: 2.3.x=로봇 텍스처 붕괴 / 3.10=API 크래시 / 3.3.2=정상 (HF 문서 기준)
+      - h5py
+      - pillow
+      - scikit-learn
+      - pyyaml
+      - imageio[ffmpeg]            # 롤아웃 영상

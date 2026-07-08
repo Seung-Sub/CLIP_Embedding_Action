@@ -1,0 +1,28 @@
+# 데이터·모델·산출물은 커밋하지 않음 (재현 방법은 README 참조)
+/data/
+/checkpoints/
+/outputs/
+/wandb/
+/docs/
+/models/
+# ALOHA 트랙 — 더이상 공개 리포에서 관리하지 않음 (LIBERO만 공유)
+/aloha/
+/src/eval_aloha/
+/src/data/act_sim.py
+/environment.yml
+/configs/phase1.yaml
+/configs/phase2.yaml
+/configs/phase2_mlp.yaml
+# 비공개 어블레이션 실험 (코드+문서+로그)
+/ablation/
+# 실행 로그 (결과 요약은 experiments/*.jsonl로 남김)
+scripts/*.log
+# 파이썬 잔재
+__pycache__/
+*.pyc
+
+# 대용량 모델 파일 안전망
+*.pt
+*.pth
+*.hdf5
+*.npz

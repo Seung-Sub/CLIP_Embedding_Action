@@ -1,0 +1,35 @@
+# Phase 1 (LIBERO 트랙) — 액션청크 <-> Δz 결합 AE
+# state_cond, pooled Δz. 20Hz(청크 0.8초=16스텝), OSC 델타 7D, agentview 카메라.
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_object
+  camera: agentview_rgb
+  chunk_sec: 0.8               # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2            # 비율 — 500 데모 중 100 (태스크 혼합 무작위)
+  cache_dir: ~/clip_ws/outputs/cache/libero_obj_emb
+
+model:
+  latent_dim: 768
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_obj.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_obj}

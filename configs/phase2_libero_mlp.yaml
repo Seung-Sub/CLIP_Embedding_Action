@@ -1,0 +1,38 @@
+# Phase 2 (LIBERO 트랙) — 베이스라인: MLP-concat 회귀 (비교 실험용)
+# Spatial 36.5% (20롤×10태스크). SOTA는 configs/phase2_libero.yaml.
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+
+module:
+  name: mlp
+  lang_token: true             # 멀티태스크 언어 조건화 (필수)
+  d_model: 1024
+  layers: 4
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_mlp}

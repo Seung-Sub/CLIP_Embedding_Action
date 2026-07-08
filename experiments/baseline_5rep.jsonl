@@ -1,0 +1,5 @@
+{"ablation":"none","rep":1,"rc":0,"mean_success":83.0}
+{"ablation":"none","rep":2,"rc":0,"mean_success":85.0}
+{"ablation":"none","rep":3,"rc":0,"mean_success":86.0}
+{"ablation":"none","rep":4,"rc":0,"mean_success":86.0}
+{"ablation":"none","rep":5,"rc":0,"mean_success":86.0}

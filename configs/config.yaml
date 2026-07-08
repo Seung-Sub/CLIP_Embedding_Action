@@ -1,0 +1,6 @@
+# 공통: CLIP 백본 설정 (core/clip_wrapper.py가 읽음)
+clip:
+  model_dir: ~/clip_ws/models/clip-vit-large-patch14   # frozen ViT-L/14 (README 1단계에서 다운로드)
+  device: cuda
+  dtype: float16
+  save_token_vectors: true
