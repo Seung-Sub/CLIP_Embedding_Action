@@ -1,0 +1,52 @@
+# Phase 2 (LIBERO) — F3 obs-fusion arm b: DINOv2-reg **mean-patch** (단일 토큰, 학습 attn 없음).
+# F2의 patch-mean 대응 = "naive dense". arm c(attnpool)가 이 b와 a(no-obs) 양쪽을 이겨야
+# 진짜 dense(공간 선택적) 신호 (cowork B.2). obsc.yaml 복사 + pool:mean.
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  obs:
+    encoders:
+      - {name: dinov2, model_dir: facebook/dinov2-with-registers-large, camera: agentview_rgb}
+    pool: mean                   # ★ patch-mean 단일 토큰 (naive dense 베이스라인)
+    n_query: 8                   # mean에서는 무시(K=1)
+    d_attn: 768
+    unshuffle: 1
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_obsb.pt
+
+wandb: {enabled: false, project: clipvp, mode: online, run_name: phase2_libero_obsb}

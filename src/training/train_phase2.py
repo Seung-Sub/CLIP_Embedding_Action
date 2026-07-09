@@ -50,6 +50,8 @@ def apply_override(cfg, kv):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--max-episodes", type=int, default=None,
+                    help="학습 에피소드 수 제한 (F3 공정 subset — 고정시드로 arm 간 동일 표본)")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VAL")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--config", default=str(CFG_PATH))
@@ -89,6 +91,9 @@ def main():
     files = ds.episode_files()
     if args.smoke:
         files = files[:2]
+    elif args.max_episodes:                       # F3 공정 subset (고정시드=arm 간 동일 표본)
+        sub = np.random.RandomState(0).permutation(len(files))[:args.max_episodes]
+        files = [files[i] for i in sub]
     perm = rng.permutation(len(files))
     v = cfg["data"]["val_episodes"]
     # 1 미만이면 비율(예: 0.2 = 20%), 이상이면 개수
