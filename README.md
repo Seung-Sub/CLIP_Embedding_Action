@@ -10,6 +10,23 @@ Phase 2:  토큰 [z_{t−16}, z_t, g(A_{t−16}), 언어, 손목캠] → flow ma
 폐루프:   16스텝 예측 → 앞 8스텝만 사용 → 재예측 (receding horizon)
 ```
 
+## 문서 맵 (먼저 읽을 것)
+
+이 레포는 **정착된 파이프라인**(이 README 본문 = 설치·학습·평가·§7 결과) 위에서
+**F-시리즈 연구**(융합 앵커·dense 관측·학습형 latent action 확장)가 **진행 중**이다.
+목적별로 읽을 문서:
+
+| 문서 | 성격 | 내용 |
+|---|---|---|
+| `README.md` (이 파일) | **사용법** | 설치 + phase1/2 학습 + 롤아웃 평가 + 정착 파이프라인 결과 |
+| `DESIGN_fusion_dense_latent_action_v1.md` | **연구 설계** | F-시리즈의 "무엇을·왜" (앵커 융합·dense 관측·latent action, 단계 F0–F7) |
+| `KICKOFF.md` | **실행 지시** | F-시리즈 실행자(Claude Code) 착수 지시·불변식 |
+| `PROGRESS.md` | **진행 로그** | F-시리즈 개발 devlog (무엇을/어떻게/결과, 최신 순) |
+
+새로 합류했다면: 파이프라인을 **쓰려면** 이 README를, 연구 맥락을 **이해하려면**
+`DESIGN` → `PROGRESS` 순으로 보라. (내부 규율 문서 — 예측 장부·NUMBER_CARD 등 — 은
+비공개 gitignore이며 팔로업엔 `PROGRESS.md`로 충분하다.)
+
 ## 0. 요구사항
 
 - Linux + NVIDIA GPU (VRAM 12GB 이상 권장; RTX 5070 Ti급 Blackwell은 포함된 cu128 torch 필수)
@@ -170,14 +187,19 @@ MUJOCO_GL=egl python src/eval_libero/recovery_probe_gui.py
   ```
 - 주요 `module` 키: `name`(mlp|flow) · `d_model` · `layers` · `ctx_layers`(flow 문맥 인코더) ·
   `flow_steps`(Euler 스텝) · `lang_token`(LIBERO 언어) · `wrist_token`+`data.wrist_camera`(LIBERO 손목캠)
+- **F-시리즈 연구 옵션**(정착 레시피 밖, 상세는 `DESIGN`·`PROGRESS`): 다중 백본 앵커
+  (phase1 config `anchor:` 섹션, `core/anchor.py`) · phase1 언어정렬 `DeltaAE(align_mode={dz,direct,hybrid})`
+  · 언어사용 판별 `rollout_sim.py --instruction-mode {correct,wrong,blank}` · dense 프로브
+  `src/diagnosis/f2_dense_probe.py`. 기본값은 모두 정착 파이프라인과 동일(비트 동형).
 
 ## 5. 디렉터리
 
 | 경로 | 내용 |
 |---|---|
 | `configs/` | phase1/phase2 설정 (`*_libero.yaml` / 베이스라인: `*_mlp.yaml`) |
-| `src/core` `src/data` `src/models` `src/training` | CLIP 래퍼 · 로더(임베딩 캐시) · DeltaAE+정책 · 트레이너 |
-| `src/eval_libero` | GT 평가(`rollout_dataset.py`) / 폐루프 평가(`rollout_sim.py`) / 다단계 연쇄(`*_serial.py`) / 잠재공간 시각화(`latent_mapping.py`) / 페러프레이징 전용 폐루프(`rollout_sim_paraphrase.py`) / 실패 복구·페러프레이징 관찰 GUI(`recovery_probe_gui.py`) |
+| `src/core` `src/data` `src/models` `src/training` | CLIP 래퍼 · 다중 백본 앵커 추상화(`core/anchor.py`, F-시리즈) · 로더(임베딩 캐시) · 모션문장 생성(`data/motion_lang.py`, HY03 언어정렬) · DeltaAE+정책 · 트레이너 |
+| `src/diagnosis` | F-시리즈 진단 도구 (`f2_dense_probe.py` — dense 디코더빌리티 오프라인 프로브) |
+| `src/eval_libero` | GT 평가(`rollout_dataset.py`) / 폐루프 평가(`rollout_sim.py`, 언어사용 판별용 `--instruction-mode {correct,wrong,blank}` 지원) / 다단계 연쇄(`*_serial.py`) / 잠재공간 시각화(`latent_mapping.py`) / 페러프레이징 전용 폐루프(`rollout_sim_paraphrase.py`) / 실패 복구·페러프레이징 관찰 GUI(`recovery_probe_gui.py`) |
 | `experiments/` | §7 결과의 원본 데이터(jsonl/txt) |
 | `data/` `checkpoints/` `outputs/` | 데이터 / 학습 결과 / 캐시·평가 산출물 (git 제외) |
 

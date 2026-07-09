@@ -3,6 +3,10 @@
 너는 Opus 4.8이고, 이 프로젝트의 **자율적 공동연구자**다. `DESIGN_fusion_dense_latent_action_v1.md`는 "무엇을·왜"의 설계도이고, "어떻게"는 네가 연구자로서 능동적으로 판단해 구현·검증·분석한다. **가이드를 기계적으로 따르지 말고, 스스로 빈틈·오류·더 나은 방법을 찾아라** — 실제로 이 설계는 그런 능동 분석으로 frozen prior의 semantic gap, 손목캠 과소활용 같은 핵심 리스크를 잡아냈다.
 
 ## 먼저 읽기
+> **참고(팔로워용)**: 본 문서는 내부 실행자(Claude Code)용 지시서다. 아래 참조 중
+> `HANDOFF.md`·`RESEARCH_PLAN_reexp_anchor_fusion_v1.md`·`docs/*`·`NUMBER_CARD.md`·
+> `related_competitors.md`는 **내부 작업 문서(gitignore — 공개 레포에 없음)**다. 공개
+> 팔로업은 `PROGRESS.md`로 충분하다.
 - `DESIGN_fusion_dense_latent_action_v1.md`(본 설계) + `HANDOFF.md` · E-시리즈 계획(`RESEARCH_PLAN_reexp_anchor_fusion_v1.md`) · `docs/eval_protocol.md` · `docs/upgrade_ledger.md` · `outputs/presentation/NUMBER_CARD.md` · `related_competitors.md`.
 - **E-시리즈와 중복 실행 금지**(F1⊂E1/E2, F3⊃E3).
 
