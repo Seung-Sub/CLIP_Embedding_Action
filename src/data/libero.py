@@ -30,6 +30,9 @@ class LiberoDataset:
         self.n_chunk = int(d["n_chunk"])
         self.cache_dir = Path(os.path.expanduser(d["cache_dir"]))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # dense(patch) 캐시 경로 — pooled와 분리 (F3/F4 dense 경로용, 기본 미사용).
+        self.dense_cache_dir = Path(os.path.expanduser(
+            d.get("dense_cache_dir", str(self.cache_dir / "dense"))))
         self.span = max(2, int(round(self.chunk_sec * HZ)))
         self.stride = max(1, self.span // 8)
 
@@ -72,9 +75,20 @@ class LiberoDataset:
 
     # ---------- CLIP 임베딩 캐시 ----------
 
+    def _emb_cache(self, ep, camera, clip):
+        """앵커별 캐시 경로. 기본 CLIP(joint/norm)·cache_key 없는 인코더는 기존
+        평면 캐시(하위호환), 그 외 앵커는 cache_key 하위 디렉터리로 분리."""
+        legacy = self.cache_dir / (self._key(ep) + f"_{camera}.npz")
+        key = getattr(clip, "cache_key", None)
+        if key is None or key == "clip-vit-l-14/joint/norm":
+            return legacy
+        d = self.cache_dir / key
+        d.mkdir(parents=True, exist_ok=True)
+        return d / (self._key(ep) + f"_{camera}.npz")
+
     def embeddings(self, clip, ep, camera=None):
         camera = camera or self.camera
-        cache = self.cache_dir / (self._key(ep) + f"_{camera}.npz")
+        cache = self._emb_cache(ep, camera, clip)
         if cache.exists():
             return np.load(cache)["Z"]
         frames = [Image.fromarray(im) for im in self.load_frames(ep, camera)]
@@ -84,6 +98,25 @@ class LiberoDataset:
         Z = np.concatenate(Z)
         np.savez_compressed(cache, Z=Z)
         return Z
+
+    def dense_embeddings(self, clip, ep, camera=None):
+        """patch(dense) 토큰 캐시 [T, n_patch, d] — pooled(embeddings)와 분리 키.
+
+        F3/F4 dense 경로용. 기본 phase1/phase2 파이프라인은 호출하지 않으므로
+        pooled 경로 수치에 영향 없음 (대용량이라 옵션·서브셋부터).
+        """
+        camera = camera or self.camera
+        cache = self.dense_cache_dir / (self._key(ep) + f"_{camera}.npz")
+        if cache.exists():
+            return np.load(cache)["D"]
+        self.dense_cache_dir.mkdir(parents=True, exist_ok=True)
+        frames = [Image.fromarray(im) for im in self.load_frames(ep, camera)]
+        D = []
+        for i in range(0, len(frames), 64):
+            D.append(clip.encode_images(frames[i:i + 64])["tokens"])
+        D = np.concatenate(D)
+        np.savez_compressed(cache, D=D)
+        return D
 
     def instruction_embedding(self, clip, ep):
         path, _ = ep

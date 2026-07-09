@@ -58,7 +58,8 @@ def load_models(cfg, device):
     use_lang = m.get("lang_token", False)
     use_wrist = m.get("wrist_token", False)
     policy = build_policy_from_cfg(
-        m, n_tokens=3 + int(use_lang) + int(use_wrist)).to(device).eval()
+        m, n_tokens=3 + int(use_lang) + int(use_wrist),
+        latent_dim=p1["model"]["latent_dim"]).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
     wrist_cam = ck2["config"]["data"].get("wrist_camera") if use_wrist else None
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],

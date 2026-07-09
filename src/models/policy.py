@@ -13,18 +13,16 @@ flow 손실은 train_phase2의 flow 분기 참조 (CFM + FLD).
 import torch
 import torch.nn as nn
 
-LATENT = 768
-
 
 class MLPConcat(nn.Module):
-    def __init__(self, d_model=512, layers=4, heads=None, n_tokens=3):
+    def __init__(self, d_model=512, layers=4, heads=None, n_tokens=3, latent_dim=768):
         super().__init__()
-        dims = [n_tokens * LATENT] + [d_model] * (layers - 1)
+        dims = [n_tokens * latent_dim] + [d_model] * (layers - 1)
         net = []
         for i in range(len(dims) - 1):
             net += [nn.Linear(dims[i], dims[i + 1]), nn.GELU()]
-        net.append(nn.Linear(dims[-1], LATENT))
-        self.net = nn.Sequential(nn.LayerNorm(n_tokens * LATENT), *net)
+        net.append(nn.Linear(dims[-1], latent_dim))
+        self.net = nn.Sequential(nn.LayerNorm(n_tokens * latent_dim), *net)
 
     def forward(self, tokens):                    # (B, 3, 768)
         return self.net(tokens.flatten(1))
@@ -56,21 +54,23 @@ class FlowPolicy(nn.Module):
     A_EMB_IDX, Z_CUR_IDX = 2, 1                   # 토큰 위치 규약 고정
 
     def __init__(self, d_model=1024, layers=4, heads=None, n_tokens=3,
-                 steps=6, source="past", ctx_layers=2, source_noise=0.1):
+                 steps=6, source="past", ctx_layers=2, source_noise=0.1,
+                 latent_dim=768):
         super().__init__()
         assert source in ("noise", "past", "vision")
         self.steps, self.source, self.source_noise = steps, source, source_noise
+        self.latent_dim = latent_dim
         self.ctx = nn.Sequential(
-            nn.LayerNorm(n_tokens * LATENT),
-            nn.Linear(n_tokens * LATENT, d_model),
+            nn.LayerNorm(n_tokens * latent_dim),
+            nn.Linear(n_tokens * latent_dim, d_model),
             *[ResidualBlock(d_model) for _ in range(ctx_layers)])
         self.t_embed = nn.Sequential(nn.Linear(1, 128), nn.GELU(),
                                      nn.Linear(128, 128))
-        self.v_in = nn.Linear(LATENT + d_model + 128, d_model)
+        self.v_in = nn.Linear(latent_dim + d_model + 128, d_model)
         self.v_blocks = nn.Sequential(*[ResidualBlock(d_model)
                                         for _ in range(layers)])
         self.v_out = nn.Sequential(nn.LayerNorm(d_model),
-                                   nn.Linear(d_model, LATENT))
+                                   nn.Linear(d_model, latent_dim))
         self.register_buffer("x0_std", torch.ones(1))
 
     def _v(self, x, ctx, t):
@@ -79,7 +79,7 @@ class FlowPolicy(nn.Module):
 
     def _x0(self, tokens, generator=None):
         if self.source == "noise":
-            return torch.randn((len(tokens), LATENT), device=tokens.device,
+            return torch.randn((len(tokens), self.latent_dim), device=tokens.device,
                                generator=generator) * self.x0_std
         x0 = tokens[:, self.A_EMB_IDX if self.source == "past"
                     else self.Z_CUR_IDX].clone()
@@ -112,10 +112,13 @@ class FlowPolicy(nn.Module):
 MODULES = {"mlp": MLPConcat, "flow": FlowPolicy}
 
 
-def build_policy_from_cfg(m, n_tokens=3):
-    """module 설정 dict → 정책 (flow 전용 키 포함). 학습·평가 공용 진입점."""
+def build_policy_from_cfg(m, n_tokens=3, latent_dim=768):
+    """module 설정 dict → 정책 (flow 전용 키 포함). 학습·평가 공용 진입점.
+
+    latent_dim = 앵커/DeltaAE 잠재 차원 (phase1 체크포인트에서 주입; CLIP=768).
+    """
     kw = dict(d_model=m.get("d_model", 512), layers=m.get("layers", 4),
-              heads=m.get("heads", 8), n_tokens=n_tokens)
+              heads=m.get("heads", 8), n_tokens=n_tokens, latent_dim=latent_dim)
     if m["name"] == "flow":
         kw.update(steps=m.get("flow_steps", 6),
                   source=m.get("flow_source", "past"),

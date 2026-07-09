@@ -154,7 +154,8 @@ def main():
 
     # ---- 정책 모델 ----
     n_tokens = 3 + int(use_lang) + int(use_wrist)
-    model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens).to(device)
+    model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
+                                  latent_dim=p1["model"]["latent_dim"]).to(device)
     is_flow = isinstance(model, FlowPolicy)
     if is_flow:                                   # x0 스케일 = 잠재 타깃 분포
         with torch.no_grad():

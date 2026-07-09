@@ -45,6 +45,10 @@ def main():
     ap.add_argument("--flip", action=argparse.BooleanOptionalAction, default=False,
                     help="env 렌더 상하반전 (실측: 데모와 동일 방향 — 기본 off)")
     ap.add_argument("--save-video", type=int, default=0)
+    ap.add_argument("--instruction-mode", choices=["correct", "wrong", "blank"],
+                    default="correct",
+                    help="언어 사용 판별(§0.6 R2): correct(정상)/wrong(다른 태스크 지시문)/"
+                         "blank(빈 문자열). 언어를 실제 쓰면 wrong·blank에서 SR이 하락해야 정상")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -61,6 +65,19 @@ def main():
     suite = benchmark.get_benchmark_dict()[args.suite]()
     task_ids = [args.task_id] if args.task_id is not None \
         else list(range(suite.get_num_tasks()))
+    n_tasks = suite.get_num_tasks()
+    if args.instruction_mode != "correct" and not use_lang:
+        print(f"경고: instruction-mode={args.instruction_mode}이나 정책에 언어 토큰 없음"
+              " (use_lang=False) — 판별 대조 무의미 (correct와 동일).", flush=True)
+
+    def instruction_for(tid):
+        """판별평가 지시문 선택. wrong = 순환 오프셋(n//2)으로 결정론적 불일치."""
+        if args.instruction_mode == "blank":
+            return ""
+        if args.instruction_mode == "wrong":
+            return suite.get_task((tid + n_tasks // 2) % n_tasks).language
+        return suite.get_task(tid).language
+
     videos_dir = WS / "outputs" / "eval" / "videos"
     results = {}
 
@@ -71,8 +88,9 @@ def main():
         env = OffScreenRenderEnv(bddl_file_name=bddl,
                                  camera_heights=128, camera_widths=128)
         init_states = suite.get_task_init_states(tid)
-        lang = torch.tensor(clip.encode_texts([task.language])["embeds"][0][None],
-                            device=device) if use_lang else None
+        lang = torch.tensor(
+            clip.encode_texts([instruction_for(tid)])["embeds"][0][None],
+            device=device) if use_lang else None
         succ, infer_ms = [], []
 
         def frame(obs):
@@ -140,11 +158,11 @@ def main():
         print(f"== task {tid} [{task.language[:50]}]: {sr:.0f}% "
               f"({int(np.sum(succ))}/{args.episodes})", flush=True)
 
-    print(f"\n=== {args.suite} | 태스크당 {args.episodes} 롤아웃 ===")
+    print(f"\n=== {args.suite} | 태스크당 {args.episodes} 롤아웃 | instr={args.instruction_mode} ===")
     for tid, sr in results.items():
         print(f"task {tid:2d}: {sr:5.1f}%  {suite.get_task(tid).language[:60]}")
     print(f"평균 성공률: {np.mean(list(results.values())):.1f}%")
-    out = WS / "outputs" / "eval" / f"rollout_{args.suite}.txt"
+    out = WS / "outputs" / "eval" / f"rollout_{args.suite}_{args.instruction_mode}.txt"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(f"task{t}: {s:.1f}%" for t, s in results.items())
                    + f"\nmean: {np.mean(list(results.values())):.1f}%\n")
