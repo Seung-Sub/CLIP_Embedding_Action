@@ -142,7 +142,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Loading model and embedding cache...")
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam) = load_models(cfg, device)
+     repr_kind, wrist_cam, *_) = load_models(cfg, device)   # *_ = F3 obs (미사용)
     ds = LiberoDataset(cfg)
     clip = ClipWrapper()
 

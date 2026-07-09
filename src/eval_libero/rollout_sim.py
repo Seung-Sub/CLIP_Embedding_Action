@@ -57,7 +57,7 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion) = load_models(cfg, device)
     ds = LiberoDataset(cfg)          # span/resample 재사용
     clip = ClipWrapper()
     span, H = ds.span, args.exec_horizon
@@ -105,6 +105,21 @@ def main():
             img = img[::-1].copy() if args.flip else img
             return clip.encode_images([Image.fromarray(img)])["embeds"][0]
 
+        def obs_toks(obs):
+            """F3: 현재 프레임의 dense patch 토큰 → obs_fusion → K개 관측 토큰.
+            앵커 카메라(기본 agentview_rgb)에 맞춰 프레임 선택; zc 와 동일 프레임."""
+            feat = {}
+            for name, anc, cam in obs_anchors:
+                if wrist_cam and cam == wrist_cam:
+                    im = obs["robot0_eye_in_hand_image"]
+                    im = im[::-1].copy() if args.flip else im
+                else:
+                    im = frame(obs)
+                tok = anc.encode_images([Image.fromarray(im)])["tokens"]  # (1,P,d)
+                feat[name] = torch.tensor(tok, device=device)
+            ot = obs_fusion(feat)                            # (1,K,768)
+            return [ot[:, k] for k in range(ot.size(1))]
+
         for ep in range(args.episodes):
             env.reset()
             obs = env.set_init_state(init_states[ep % len(init_states)])
@@ -127,6 +142,8 @@ def main():
                     toks = [zp, zc, a_emb] + ([lang] if use_lang else []) \
                         + ([torch.tensor(encode_wrist(obs)[None], device=device)]
                            if wrist_cam else [])
+                    if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
+                        toks = toks + obs_toks(obs)
                     zeta = policy(torch.stack(toks, dim=1))
                     ahat = chunkrep.from_repr(
                         ae.h(zeta, zc).cpu().numpy()[0], repr_kind) \

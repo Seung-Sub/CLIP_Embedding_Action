@@ -57,14 +57,40 @@ def load_models(cfg, device):
     m = ck2["config"]["module"]
     use_lang = m.get("lang_token", False)
     use_wrist = m.get("wrist_token", False)
+
+    # ---- F3 관측 융합 (module.obs 있을 때만; 없으면 no-obs 기존 경로와 완전 동일) ----
+    # phase2 학습(train_phase2.py)의 앵커·ObsFusion 구성을 그대로 미러링한다.
+    obs_anchors, obs_fusion, K = None, None, 0
+    if m.get("obs"):
+        from core.anchor import get_anchor
+        from models.obs_fusion import ObsFusion
+        obs_cfg = m["obs"]
+        obs_anchors, enc_dims = [], {}
+        for enc in obs_cfg["encoders"]:
+            anc = get_anchor({"anchor": enc})
+            if enc["name"] == "siglip2":
+                anc.save_tokens = True                # siglip2: 패치 토큰 반환 활성화
+            obs_anchors.append((enc["name"], anc,
+                                enc.get("camera", "agentview_rgb")))
+            enc_dims[enc["name"]] = anc.patch_dim     # dinov2=1024 / siglip2=1152
+        obs_fusion = ObsFusion(enc_dims, d_attn=obs_cfg.get("d_attn", 768),
+                               n_query=obs_cfg.get("n_query", 8),
+                               out_dim=p1["model"]["latent_dim"],
+                               pool=obs_cfg.get("pool", "attn"),
+                               unshuffle=obs_cfg.get("unshuffle", 1))
+        obs_fusion.load_state_dict(ck2["obs_fusion"])
+        obs_fusion = obs_fusion.to(device).eval()
+        K = obs_fusion.n_query                        # attn: n_query / mean: 1
+
     policy = build_policy_from_cfg(
-        m, n_tokens=3 + int(use_lang) + int(use_wrist),
+        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K,
         latent_dim=p1["model"]["latent_dim"]).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
     wrist_cam = ck2["config"]["data"].get("wrist_camera") if use_wrist else None
+    # obs_anchors/obs_fusion 는 obs일 때만 non-None; no-obs 호출부는 무시(*_)한다.
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam)
+            wrist_cam, obs_anchors, obs_fusion)
 
 
 def main():
@@ -77,7 +103,7 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
     clip = ClipWrapper()
 
@@ -93,6 +119,9 @@ def main():
     acts = ds.load_actions(ep)
     Z = ds.embeddings(clip, ep)
     Zw = ds.embeddings(clip, ep, wrist_cam) if wrist_cam else None
+    # F3: 앵커별 dense patch 토큰 D[t] (Z[t]=z_cur 와 동일 인덱스 정렬)
+    D_obs = ([(name, ds.dense_embeddings(anc, ep, cam))
+              for name, anc, cam in obs_anchors] if obs_fusion is not None else [])
     lang = torch.tensor(ds.instruction_embedding(clip, ep)[None],
                         device=device) if use_lang else None
     T = len(acts)
@@ -113,6 +142,10 @@ def main():
             toks = [z_prev, z_cur, a_emb] + ([lang] if use_lang else []) \
                 + ([torch.tensor(Zw[t][None], device=device)]
                    if wrist_cam else [])
+            if obs_fusion is not None:                # F3: 관측 토큰 K개를 열 끝에 추가
+                obs_tok = obs_fusion({name: torch.tensor(D[t][None], device=device)
+                                      for name, D in D_obs})       # (1,K,768)
+                toks = toks + [obs_tok[:, k] for k in range(obs_tok.size(1))]
             zeta = policy(torch.stack(toks, dim=1))
             ahat = chunkrep.from_repr(ae.h(zeta, z_cur).cpu().numpy()[0],
                                       repr_kind) * a_std + a_mean
