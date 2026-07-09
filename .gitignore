@@ -26,3 +26,6 @@ __pycache__/
 *.pth
 *.hdf5
 *.npz
+
+# cowork 제공 참고 논문 PDF (리서치용, 공개 레포 제외)
+/Related_Papers/
