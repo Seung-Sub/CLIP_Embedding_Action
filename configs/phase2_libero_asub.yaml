@@ -1,0 +1,41 @@
+# Phase 2 (LIBERO) — F3 arm a (no-obs) 롤아웃용: 120ep 공정 subset로 학습한 phase2_a_sub.pt 지정.
+# phase2_libero.yaml과 동일하되 checkpoint만 subset 학습본으로. (obs 블록 없음 = no-obs 기준선)
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+
+loss: {lat: 0.5, act: 1.0, wm: 0.0}
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_a_sub.pt
+
+wandb: {enabled: false, project: clipvp, mode: online, run_name: phase2_libero_asub}
