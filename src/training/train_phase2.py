@@ -95,8 +95,24 @@ def main():
     n_val = 1 if args.smoke else (max(1, round(len(files) * v)) if v < 1 else int(v))
     val_ids, tr_ids = perm[:n_val], perm[n_val:]
     clip = ClipWrapper()
+
+    # ---- F3 관측 융합 앵커 (module.obs 있을 때만; 없으면 기존 no-obs 경로와 완전 동일) ----
+    obs_cfg = m_cfg.get("obs")
+    obs_anchors, enc_dims, enc_names = None, {}, []
+    if obs_cfg:
+        from core.anchor import get_anchor
+        obs_anchors = []
+        for enc in obs_cfg["encoders"]:
+            anc = get_anchor({"anchor": enc})
+            if enc["name"] == "siglip2":
+                anc.save_tokens = True                # siglip2: 패치 토큰 반환 활성화
+            obs_anchors.append((enc["name"], anc, enc.get("camera", "agentview_rgb")))
+            enc_dims[enc["name"]] = anc.patch_dim     # dinov2=1024 / siglip2=1152
+            enc_names.append(enc["name"])
+
     print("삼중쌍 구성 중 (임베딩 캐시 재사용)...")
-    eps = ds.build_policy_samples(clip, files, stride=cfg["data"].get("stride", 2))
+    eps = ds.build_policy_samples(clip, files, stride=cfg["data"].get("stride", 2),
+                                  obs_anchors=obs_anchors)
 
     def stack(ids):
         return tuple(np.concatenate([eps[i][k] for i in ids])
@@ -105,12 +121,16 @@ def main():
     Zp_tr, Zc_tr, Zn_tr, Ap_tr, Af_tr, *Wx_tr = stack(tr_ids)
     Zp_va, Zc_va, Zn_va, Ap_va, Af_va, *Wx_va = stack(val_ids)
 
-    # 손목캠 토큰: 로더가 6번째 배열(z_wrist)을 준 경우에만 사용 가능
+    # 손목캠 토큰: 로더가 6번째 배열(z_wrist)을 준 경우에만 사용 가능.
+    # 6번째 이후는 F3 관측 dense 배열(인코더 순서). n_wrist로 잘라 분리한다.
     use_wrist = m_cfg.get("wrist_token", False)
-    if use_wrist and not Wx_tr:
+    if use_wrist and not ds.wrist_camera:
         raise ValueError("module.wrist_token=true지만 data.wrist_camera 미설정")
+    n_wrist = 1 if ds.wrist_camera else 0
     W_tr = Wx_tr[0] if use_wrist else None
     W_va = Wx_va[0] if use_wrist else None
+    Dobs_tr = Wx_tr[n_wrist:] if obs_cfg else []      # 인코더별 dense [N,P,d]
+    Dobs_va = Wx_va[n_wrist:] if obs_cfg else []
 
     # 언어 토큰 (멀티태스크 조건화): 에피소드별 지시문 임베딩을 샘플 수만큼 복제
     use_lang = m_cfg.get("lang_token", False)
@@ -152,8 +172,19 @@ def main():
         wb = wandb.init(project=wb_cfg["project"], name=wb_cfg.get("run_name"),
                         mode=wb_cfg.get("mode", "online"), config=cfg)
 
+    # ---- F3 관측 융합 모듈 (obs일 때만; K개 관측 토큰을 정책 입력열 끝에 추가) ----
+    obs_fusion, K = None, 0
+    if obs_cfg:
+        from models.obs_fusion import ObsFusion
+        obs_fusion = ObsFusion(enc_dims, d_attn=obs_cfg.get("d_attn", 768),
+                               n_query=obs_cfg.get("n_query", 8),
+                               out_dim=p1["model"]["latent_dim"],
+                               pool=obs_cfg.get("pool", "attn"),
+                               unshuffle=obs_cfg.get("unshuffle", 1)).to(device)
+        K = obs_fusion.n_query                        # attn: n_query / mean: 1
+
     # ---- 정책 모델 ----
-    n_tokens = 3 + int(use_lang) + int(use_wrist)
+    n_tokens = 3 + int(use_lang) + int(use_wrist) + K
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
                                   latent_dim=p1["model"]["latent_dim"]).to(device)
     is_flow = isinstance(model, FlowPolicy)
@@ -167,22 +198,27 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"policy[{m_cfg['name']}] params: {n_params/1e6:.2f}M "
           f"(d{m_cfg['d_model']}/L{m_cfg['layers']}/H{m_cfg.get('heads', 8)})")
-    opt = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"],
-                           betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
+    opt = torch.optim.Adam(
+        list(model.parameters())
+        + (list(obs_fusion.parameters()) if obs_cfg else []),
+        lr=t_cfg["lr"],
+        betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
 
     L_tr_t = torch.tensor(L_tr) if use_lang else torch.zeros(len(Cp_tr), 0)
     W_tr_t = torch.tensor(W_tr) if use_wrist else torch.zeros(len(Cp_tr), 0)
+    Dobs_tr_t = [torch.tensor(d) for d in Dobs_tr]     # F3: 인코더별 dense (없으면 [])
     loader = DataLoader(
         TensorDataset(torch.tensor(Zp_tr), torch.tensor(Zc_tr),
                       torch.tensor(Zn_tr), torch.tensor(Cp_tr),
-                      torch.tensor(Cf_tr), L_tr_t, W_tr_t),
+                      torch.tensor(Cf_tr), L_tr_t, W_tr_t, *Dobs_tr_t),
         batch_size=t_cfg["batch_size"], shuffle=True)
     val_t = [torch.tensor(x, device=device) for x in (Zp_va, Zc_va, Zn_va)] \
         + [Ae_va.to(device), torch.tensor(Cf_va, device=device)] \
         + [torch.tensor(L_va, device=device) if use_lang
            else torch.zeros(len(Cf_va), 0, device=device)] \
         + [torch.tensor(W_va, device=device) if use_wrist
-           else torch.zeros(len(Cf_va), 0, device=device)]
+           else torch.zeros(len(Cf_va), 0, device=device)] \
+        + [torch.tensor(d, device=device) for d in Dobs_va]
     epochs = 3 if args.smoke else t_cfg["epochs"]
     best_val, best_state, patience = np.inf, None, 0
 
@@ -198,10 +234,13 @@ def main():
             return 0.5 * (1 + np.cos(np.pi * min(prog, 1.0)))
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
-    def forward(zp, zc, zn, aemb, cf, lang, wr):
+    def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs):
         toks = [zp, zc, aemb] + ([lang] if use_lang else []) \
             + ([wr] if use_wrist else [])
-        toks = torch.stack(toks, dim=1)               # (B, 3~5, 768)
+        if obs_cfg:                                   # F3: 관측 토큰 K개를 열 끝에 추가
+            obs_tok = obs_fusion({n: d for n, d in zip(enc_names, dobs)})  # (B,K,768)
+            toks = toks + [obs_tok[:, k] for k in range(K)]
+        toks = torch.stack(toks, dim=1)               # (B, 3~5+K, 768)
         if is_flow:
             # lat 자리 = CFM 손실, act = FLD(ODE 샘플 디코딩). val은 고정시드로 결정화
             gen = None
@@ -219,27 +258,29 @@ def main():
         zeta = model(toks)
         return policy_losses(zeta, cf, zc, zn, ae, w)
 
-    def forward_train(zp, zc, zn, cp, cf, lang, wr):
+    def forward_train(zp, zc, zn, cp, cf, lang, wr, *dobs):
         if past_noise > 0:                            # 폐루프 오차 누적 모사
             cp = cp + torch.randn_like(cp) * past_noise
         with torch.no_grad():
             aemb = ae.g(cp, zp)
-        return forward(zp, zc, zn, aemb, cf, lang, wr)
+        return forward(zp, zc, zn, aemb, cf, lang, wr, *dobs)
 
     t0 = time.time()
     for ep in range(epochs):
         model.train()
+        if obs_cfg:
+            obs_fusion.train()
         logs, parts_log = [], []
-        for zp, zc, zn, cp, cf, lang, wr in loader:
-            loss, parts = forward_train(zp.to(device), zc.to(device),
-                                        zn.to(device), cp.to(device),
-                                        cf.to(device), lang.to(device),
-                                        wr.to(device))
+        for batch in loader:
+            batch = [b.to(device) for b in batch]     # 7 base + K개 dense(obs일 때)
+            loss, parts = forward_train(*batch)
             opt.zero_grad(); loss.backward(); opt.step()
             if sched:
                 sched.step()
             logs.append(loss.item()); parts_log.append(parts)
         model.eval()
+        if obs_cfg:
+            obs_fusion.eval()
         with torch.no_grad():
             val_loss, val_parts = forward(*val_t)
         val_loss = val_loss.item()
@@ -266,9 +307,14 @@ def main():
 
     # ---- 평가 ----
     model.eval()
+    if obs_cfg:
+        obs_fusion.eval()
     with torch.no_grad():
         toks = [val_t[0], val_t[1], val_t[3]] + ([val_t[5]] if use_lang else []) \
             + ([val_t[6]] if use_wrist else [])
+        if obs_cfg:                                   # F3: 학습과 동일하게 관측 토큰 추가
+            obs_tok = obs_fusion({n: d for n, d in zip(enc_names, val_t[7:])})
+            toks = toks + [obs_tok[:, k] for k in range(K)]
         gen = torch.Generator(device=device)
         gen.manual_seed(0)
         zeta = model(torch.stack(toks, dim=1), generator=gen) if is_flow \
@@ -309,7 +355,8 @@ def main():
                "n_val": len(Cf)}
     ckpt_path = Path(os.path.expanduser(t_cfg["checkpoint"]))
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": best_state, "config": cfg, "metrics": metrics},
+    torch.save({"state_dict": best_state, "config": cfg, "metrics": metrics,
+                "obs_fusion": obs_fusion.state_dict() if obs_cfg else None},
                ckpt_path)
     print(f"저장: {ckpt_path}")
     if args.tag:

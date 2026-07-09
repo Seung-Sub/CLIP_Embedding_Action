@@ -106,10 +106,13 @@ class LiberoDataset:
         pooled 경로 수치에 영향 없음 (대용량이라 옵션·서브셋부터).
         """
         camera = camera or self.camera
-        cache = self.dense_cache_dir / (self._key(ep) + f"_{camera}.npz")
+        # 앵커 cache_key 하위 디렉터리로 분리 (DINOv2-reg vs siglip2 dense 충돌 방지).
+        key = getattr(clip, "cache_key", None)
+        d = (self.dense_cache_dir / key) if key else self.dense_cache_dir
+        cache = d / (self._key(ep) + f"_{camera}.npz")
         if cache.exists():
             return np.load(cache)["D"]
-        self.dense_cache_dir.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
         frames = [Image.fromarray(im) for im in self.load_frames(ep, camera)]
         D = []
         for i in range(0, len(frames), 64):
@@ -154,8 +157,13 @@ class LiberoDataset:
                 print(f"  {self._key(ep)}: T={T}, pairs {len(starts)}")
         return out
 
-    def build_policy_samples(self, clip, files=None, stride=2):
-        """연속 윈도우 삼중쌍 (경계 포함 — 롤아웃 부트스트랩 분포 커버)."""
+    def build_policy_samples(self, clip, files=None, stride=2, obs_anchors=None):
+        """연속 윈도우 삼중쌍 (경계 포함 — 롤아웃 부트스트랩 분포 커버).
+
+        obs_anchors: [(name, anchor, camera), ...] (F3 obs-fusion). 주어지면 각
+        관측 앵커의 dense patch 토큰 D_cur[t] (Zc와 동일 starts 정렬)을 손목캠
+        배열 뒤에 순서대로 덧붙인다. None(기본)이면 출력은 기존과 완전 동일.
+        """
         files = files or self.episode_files()
         out = []
         for ep in files:
@@ -180,6 +188,9 @@ class LiberoDataset:
             if self.wrist_camera:                    # 6번째: 손목캠 z_t (정책 토큰용)
                 Zw = self.embeddings(clip, ep, self.wrist_camera)
                 arrs.append(np.stack([Zw[t] for t in starts]))
+            for _name, anchor, cam in (obs_anchors or []):   # F3: 관측 앵커별 dense
+                D = self.dense_embeddings(anchor, ep, cam)   # [T, P, d]
+                arrs.append(np.stack([D[t] for t in starts]))
             out.append(tuple(x.astype(np.float32) for x in arrs))
         return out
 
