@@ -154,6 +154,9 @@ class Dinov2Anchor(BaseAnchor):
         self.model = AutoModel.from_pretrained(
             src, dtype=torch.float16 if self.device == "cuda" else torch.float32
         ).to(self.device).eval()
+        # with-registers 판 감지: last_hidden = [CLS, R개 레지스터, 패치…] (R=4).
+        # 무레지스터(기본 dinov2-large)는 0 → 패치 slice가 [:, 1:]로 기존과 동일.
+        self.num_registers = getattr(self.model.config, "num_register_tokens", 0) or 0
         if center_crop:
             self.processor = AutoImageProcessor.from_pretrained(src)
             self.id = "dinov2-large"                     # 구판 (crop) — 기존 캐시 호환
@@ -162,6 +165,8 @@ class Dinov2Anchor(BaseAnchor):
                 src, do_center_crop=False,
                 size={"height": 224, "width": 224}, do_resize=True)
             self.id = "dinov2-large-nc"                  # no-crop 판 = 새 캐시 키
+        if self.num_registers:
+            self.id += "-reg"                            # 레지스터 판 = 별도 dense 캐시 키
         assert pooled in ("cls", "clsmp"), pooled
         self.pooled = pooled
         if pooled == "clsmp":
@@ -173,11 +178,12 @@ class Dinov2Anchor(BaseAnchor):
         inputs = self.processor(images=pil_images, return_tensors="pt").to(self.device)
         out = self.model(pixel_values=inputs["pixel_values"].to(self.model.dtype))
         cls = out.pooler_output                          # = last_hidden[:, 0] (HF 검증)
+        sl = 1 + self.num_registers                      # CLS(+레지스터) 제거 → 패치만
         if self.pooled == "clsmp":
-            pm = out.last_hidden_state[:, 1:].mean(dim=1)
+            pm = out.last_hidden_state[:, sl:].mean(dim=1)
             cls = torch.cat([cls, pm], dim=1)
         return {"embeds": self._post(cls),
-                "tokens": out.last_hidden_state.float().cpu().numpy()}
+                "tokens": out.last_hidden_state[:, sl:].float().cpu().numpy()}
 
 
 _REGISTRY = {"clip": ClipAnchor, "siglip2": Siglip2Anchor, "dinov2": Dinov2Anchor}
