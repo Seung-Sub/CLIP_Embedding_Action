@@ -24,7 +24,7 @@ import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
 from core import chunkrep
-from core.clip_wrapper import ClipWrapper
+from core.anchor import get_anchor
 from data import get_dataset
 from models.networks import DeltaAE
 from models.policy import FlowPolicy, build_policy_from_cfg, policy_losses
@@ -99,7 +99,7 @@ def main():
     # 1 미만이면 비율(예: 0.2 = 20%), 이상이면 개수
     n_val = 1 if args.smoke else (max(1, round(len(files) * v)) if v < 1 else int(v))
     val_ids, tr_ids = perm[:n_val], perm[n_val:]
-    clip = ClipWrapper()
+    clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
 
     # ---- F3 관측 융합 앵커 (module.obs 있을 때만; 없으면 기존 no-obs 경로와 완전 동일) ----
     obs_cfg = m_cfg.get("obs")

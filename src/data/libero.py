@@ -123,7 +123,15 @@ class LiberoDataset:
 
     def instruction_embedding(self, clip, ep):
         path, _ = ep
-        cache = self.cache_dir / (path.stem + "_lang.npz")
+        # 앵커별 텍스트 공간 분리(CLIP 768d vs SigLIP2 1152d). CLIP joint/norm은
+        # 평면 캐시 유지(하위호환·bit-identity), 그 외 앵커는 cache_key 하위로.
+        key = getattr(clip, "cache_key", None)
+        if key is None or key == "clip-vit-l-14/joint/norm":
+            cache = self.cache_dir / (path.stem + "_lang.npz")
+        else:
+            d = self.cache_dir / key
+            d.mkdir(parents=True, exist_ok=True)
+            cache = d / (path.stem + "_lang.npz")
         if cache.exists():
             return np.load(cache)["L"]
         L = clip.encode_texts([self.instruction(ep)])["embeds"][0]

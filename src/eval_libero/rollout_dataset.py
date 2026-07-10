@@ -32,7 +32,7 @@ matplotlib.rcParams.update({"font.family": ["Noto Sans CJK JP", "sans-serif"],
 import matplotlib.pyplot as plt
 
 from core import chunkrep
-from core.clip_wrapper import ClipWrapper
+from core.anchor import get_anchor
 from data.libero import LiberoDataset
 from models.networks import DeltaAE
 from models.policy import build_policy_from_cfg
@@ -105,7 +105,7 @@ def main():
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
-    clip = ClipWrapper()
+    clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
 
     eps = ds.episode_files()
     rng = np.random.RandomState(cfg["train"]["seed"])
