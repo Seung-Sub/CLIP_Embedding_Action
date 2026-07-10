@@ -49,12 +49,16 @@ def main():
                     default="correct",
                     help="언어 사용 판별(§0.6 R2): correct(정상)/wrong(다른 태스크 지시문)/"
                          "blank(빈 문자열). 언어를 실제 쓰면 wrong·blank에서 SR이 하락해야 정상")
+    ap.add_argument("--checkpoint", default=None,
+                    help="cfg train.checkpoint 덮어쓰기 (시드/변형 롤아웃 — 별도 config 불요)")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
 
     cfg = yaml.safe_load(open(args.config))
+    if args.checkpoint:                              # 시드/변형 체크포인트 오버라이드
+        cfg["train"]["checkpoint"] = args.checkpoint
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion) = load_models(cfg, device)
