@@ -45,10 +45,12 @@ def main():
     ap.add_argument("--flip", action=argparse.BooleanOptionalAction, default=False,
                     help="env 렌더 상하반전 (실측: 데모와 동일 방향 — 기본 off)")
     ap.add_argument("--save-video", type=int, default=0)
-    ap.add_argument("--instruction-mode", choices=["correct", "wrong", "blank"],
+    ap.add_argument("--instruction-mode",
+                    choices=["correct", "wrong", "blank", "swap"],
                     default="correct",
                     help="언어 사용 판별(§0.6 R2): correct(정상)/wrong(다른 태스크 지시문)/"
-                         "blank(빈 문자열). 언어를 실제 쓰면 wrong·blank에서 SR이 하락해야 정상")
+                         "blank(빈 문자열)/swap(1c: 같은 씬 내 타깃-스왑 — bowl_2를 가리키는 "
+                         "형제 태스크 지시문). swap에서는 instructed/orig/neither 3율을 보고")
     ap.add_argument("--checkpoint", default=None,
                     help="cfg train.checkpoint 덮어쓰기 (시드/변형 롤아웃 — 별도 config 불요)")
     args = ap.parse_args()
@@ -74,16 +76,25 @@ def main():
         print(f"경고: instruction-mode={args.instruction_mode}이나 정책에 언어 토큰 없음"
               " (use_lang=False) — 판별 대조 무의미 (correct와 동일).", flush=True)
 
+    # 1c 씬-내 타깃-스왑: tid → 이 씬의 bowl_2 위치를 서술하는 형제 태스크 tid.
+    # (libero_spatial: 각 씬에 bowl_1=태스크목표, bowl_2=distractor)
+    SWAP = {0: 1, 1: 6, 2: 8, 3: 9, 4: 9, 5: 3, 6: 7, 7: 9, 8: 1, 9: 7}
+
     def instruction_for(tid):
-        """판별평가 지시문 선택. wrong = 순환 오프셋(n//2)으로 결정론적 불일치."""
+        """판별평가 지시문 선택. wrong = 순환 오프셋(n//2)으로 결정론적 불일치.
+        swap = 같은 씬 bowl_2를 가리키는 형제 태스크 지시문(SWAP)."""
         if args.instruction_mode == "blank":
             return ""
         if args.instruction_mode == "wrong":
             return suite.get_task((tid + n_tasks // 2) % n_tasks).language
+        if args.instruction_mode == "swap":
+            return suite.get_task(SWAP[tid]).language
         return suite.get_task(tid).language
 
     videos_dir = WS / "outputs" / "eval" / "videos"
     results = {}
+    is_swap = args.instruction_mode == "swap"
+    swap_results = {}                                # tid → (instr_sr, orig_sr, neither_sr)
 
     for tid in task_ids:
         task = suite.get_task(tid)
@@ -96,6 +107,7 @@ def main():
             clip.encode_texts([instruction_for(tid)])["embeds"][0][None],
             device=device) if use_lang else None
         succ, infer_ms = [], []
+        swap_instr, swap_orig = [], []               # 1c: 지시타깃/원래타깃 도달 여부
 
         def frame(obs):
             img = obs["agentview_image"]
@@ -133,9 +145,9 @@ def main():
             past_actions = collections.deque([rest.copy() for _ in range(span)],
                                              maxlen=span)
             z_hist = collections.deque([encode(obs)], maxlen=span // H + 1)
-            frames, done, t = [], False, 0
+            frames, done, instructed, t = [], False, False, 0
             with torch.no_grad():
-                while t < args.max_steps and not done:
+                while t < args.max_steps and not done and not instructed:
                     t0 = time.time()
                     past = ds.resample_chunk(np.stack(past_actions))
                     past = ((past - a_mean) / a_std).astype(np.float32)
@@ -161,13 +173,26 @@ def main():
                             frames.append(frame(obs)[::-1])   # 모델 입력(frame)은 비반전 유지,
                                                               # 영상은 사람이 보기 위해 반전
                         t += 1
-                        if done:
+                        if is_swap:                  # 1c: bowl_2(지시타깃) 접시 도달 판정
+                            instructed = bool(env.env._eval_predicate(
+                                ("on", "akita_black_bowl_2", "plate_1")))
+                        if done or instructed:
                             break
                     z_hist.append(encode(obs))
-            ok = bool(done)                          # LIBERO: done == success
-            succ.append(ok)
-            print(f"[task {tid}] ep {ep:2d} | {'SUCCESS' if ok else 'fail'} "
-                  f"| steps {t} | 추론 {np.mean(infer_ms):.1f}ms", flush=True)
+            ok = bool(done)                          # LIBERO: done == success (bowl_1)
+            if is_swap:
+                instr, orig = bool(instructed), ok
+                swap_instr.append(instr)
+                swap_orig.append(orig)
+                succ.append(instr)                   # primary SR = instructed(bowl_2)
+                label = ("INSTRUCTED(bowl_2)" if instr
+                         else "ORIG(bowl_1)" if orig else "neither")
+                print(f"[task {tid}] ep {ep:2d} | {label} "
+                      f"| steps {t} | 추론 {np.mean(infer_ms):.1f}ms", flush=True)
+            else:
+                succ.append(ok)
+                print(f"[task {tid}] ep {ep:2d} | {'SUCCESS' if ok else 'fail'} "
+                      f"| steps {t} | 추론 {np.mean(infer_ms):.1f}ms", flush=True)
             if ep < args.save_video and frames:
                 import imageio
                 videos_dir.mkdir(parents=True, exist_ok=True)
@@ -176,8 +201,20 @@ def main():
         env.close()
         sr = float(np.mean(succ)) * 100
         results[tid] = sr
+        # greppable 라인은 유지: swap 모드에선 X% = instructed-SR (기존 집계 호환)
         print(f"== task {tid} [{task.language[:50]}]: {sr:.0f}% "
               f"({int(np.sum(succ))}/{args.episodes})", flush=True)
+        if is_swap:
+            n = len(swap_instr)
+            neither = [(not i) and (not o) for i, o in zip(swap_instr, swap_orig)]
+            instr_sr = float(np.mean(swap_instr)) * 100
+            orig_sr = float(np.mean(swap_orig)) * 100
+            neither_sr = float(np.mean(neither)) * 100
+            swap_results[tid] = (instr_sr, orig_sr, neither_sr)
+            print(f"   [swap] instructed(bowl_2)={instr_sr:.0f}% "
+                  f"({int(np.sum(swap_instr))}/{n}) | "
+                  f"orig(bowl_1)={orig_sr:.0f}% ({int(np.sum(swap_orig))}/{n}) | "
+                  f"neither={neither_sr:.0f}% ({int(np.sum(neither))}/{n})", flush=True)
 
     print(f"\n=== {args.suite} | 태스크당 {args.episodes} 롤아웃 | instr={args.instruction_mode} ===")
     for tid, sr in results.items():
@@ -185,8 +222,23 @@ def main():
     print(f"평균 성공률: {np.mean(list(results.values())):.1f}%")
     out = WS / "outputs" / "eval" / f"rollout_{args.suite}_{args.instruction_mode}.txt"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(f"task{t}: {s:.1f}%" for t, s in results.items())
-                   + f"\nmean: {np.mean(list(results.values())):.1f}%\n")
+    txt = ("\n".join(f"task{t}: {s:.1f}%" for t, s in results.items())
+           + f"\nmean: {np.mean(list(results.values())):.1f}%\n")
+    if is_swap:                                      # 1c: 3율 브레이크다운 추가 출력/저장
+        print("--- swap (1c) instructed / orig / neither ---")
+        for tid, (i_sr, o_sr, n_sr) in swap_results.items():
+            print(f"task {tid:2d}: instructed {i_sr:5.1f}% | "
+                  f"orig {o_sr:5.1f}% | neither {n_sr:5.1f}%")
+        m_i = np.mean([v[0] for v in swap_results.values()])
+        m_o = np.mean([v[1] for v in swap_results.values()])
+        m_n = np.mean([v[2] for v in swap_results.values()])
+        print(f"mean: instructed {m_i:.1f}% | orig {m_o:.1f}% | neither {m_n:.1f}%")
+        txt += "".join(f"task{t}_swap: instructed {i:.1f}% orig {o:.1f}% "
+                       f"neither {n:.1f}%\n"
+                       for t, (i, o, n) in swap_results.items())
+        txt += (f"mean_swap: instructed {m_i:.1f}% orig {m_o:.1f}% "
+                f"neither {m_n:.1f}%\n")
+    out.write_text(txt)
     print(f"저장: {out}")
 
 
