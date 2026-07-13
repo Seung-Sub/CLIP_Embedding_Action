@@ -29,13 +29,19 @@ class MLPConcat(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """pre-LN 잔차 FFN 블록 (트랜스포머 FFN 동형) — 순수 MLP의 깊이 포화 해소."""
+    """pre-LN 잔차 FFN 블록 (트랜스포머 FFN 동형) — 순수 MLP의 깊이 포화 해소.
 
-    def __init__(self, d):
+    dropout=0.0(기본)이면 Dropout 모듈을 만들지 않아 Sequential 인덱스가 그대로
+    → state_dict 키가 기존과 완전 동일(비트 동형, 기존 체크포인트 로드 유지)."""
+
+    def __init__(self, d, dropout=0.0):
         super().__init__()
         self.ln = nn.LayerNorm(d)
-        self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(),
-                                nn.Linear(4 * d, d))
+        ff = [nn.Linear(d, 4 * d), nn.GELU()]
+        if dropout > 0:
+            ff.append(nn.Dropout(dropout))
+        ff.append(nn.Linear(4 * d, d))
+        self.ff = nn.Sequential(*ff)
 
     def forward(self, x):
         return x + self.ff(self.ln(x))
@@ -55,19 +61,21 @@ class FlowPolicy(nn.Module):
 
     def __init__(self, d_model=1024, layers=4, heads=None, n_tokens=3,
                  steps=6, source="past", ctx_layers=2, source_noise=0.1,
-                 latent_dim=768):
+                 latent_dim=768, dropout=0.0):
         super().__init__()
         assert source in ("noise", "past", "vision")
         self.steps, self.source, self.source_noise = steps, source, source_noise
         self.latent_dim = latent_dim
+        # dropout(기본 0.0)은 ctx(=projector)·v_net 잔차블록 FFN에 적용. 0.0이면
+        # ResidualBlock이 Dropout을 만들지 않아 state_dict 키가 기존과 동일(비트 동형).
         self.ctx = nn.Sequential(
             nn.LayerNorm(n_tokens * latent_dim),
             nn.Linear(n_tokens * latent_dim, d_model),
-            *[ResidualBlock(d_model) for _ in range(ctx_layers)])
+            *[ResidualBlock(d_model, dropout) for _ in range(ctx_layers)])
         self.t_embed = nn.Sequential(nn.Linear(1, 128), nn.GELU(),
                                      nn.Linear(128, 128))
         self.v_in = nn.Linear(latent_dim + d_model + 128, d_model)
-        self.v_blocks = nn.Sequential(*[ResidualBlock(d_model)
+        self.v_blocks = nn.Sequential(*[ResidualBlock(d_model, dropout)
                                         for _ in range(layers)])
         self.v_out = nn.Sequential(nn.LayerNorm(d_model),
                                    nn.Linear(d_model, latent_dim))
@@ -123,7 +131,8 @@ def build_policy_from_cfg(m, n_tokens=3, latent_dim=768):
         kw.update(steps=m.get("flow_steps", 6),
                   source=m.get("flow_source", "past"),
                   ctx_layers=m.get("ctx_layers", 2),
-                  source_noise=m.get("source_noise", 0.1))
+                  source_noise=m.get("source_noise", 0.1),
+                  dropout=m.get("dropout", 0.0))     # 기본 0.0 = 기존과 비트 동형
     return MODULES[m["name"]](**kw)
 
 

@@ -35,7 +35,7 @@ import yaml
 from PIL import Image
 
 from core import chunkrep
-from core.clip_wrapper import ClipWrapper
+from core.anchor import get_anchor
 from data.libero import LiberoDataset
 from eval_libero.libero_para import BASE, LIBERO_PARA, LP_EVAL
 from eval_libero.rollout_dataset import load_models
@@ -65,7 +65,7 @@ def main():
      repr_kind, wrist_cam, *_) = load_models(cfg, device)   # *_ = F3 obs (미사용)
     assert use_lang, "policy has no language token — 1b (text-swap) is meaningless."
     ds = LiberoDataset(cfg)
-    clip = ClipWrapper()
+    clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     span, H = ds.span, args.exec_horizon
 
     suite = benchmark.get_benchmark_dict()[args.suite]()

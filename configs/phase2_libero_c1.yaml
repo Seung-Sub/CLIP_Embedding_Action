@@ -1,0 +1,79 @@
+# Phase 2 — C1 / F4 계층 2채널 액션코드 (cowork §D, D0–D5). SigLIP2-large-256 단독 백본.
+# ══════════════════════════════════════════════════════════════════════════
+# ζ = [ζ_g ⊕ ζ_f]:  ζ_g = pooled Δ(현행 FlowPolicy, 무변경) / ζ_f = patch ΔF fine 채널(module.f4).
+# module.f4 없으면 이 파일과 무관하게 pooled-only와 비트 동형(gate 뒤 무영향).
+#
+# ★선행 요건 (현재 미존재 — 착수 전 생성 필요):
+#   (0) phase1 AE(siglip2-large-256, 1024d):
+#       - configs/phase1_libero_siglip2.yaml 를 복사해 anchor.model_dir=google/siglip2-large-patch16-256
+#         (patch16@256 → 16×16=256 patch, 1024d) 로 바꿔 phase1 학습 →
+#         checkpoints/phase1_libero_siglip2_large256.pt
+#   (1) dense ΔF 캐시: 첫 phase2 실행이 dense_embeddings로 자동 생성(HDD /data2). 대용량(≈256×1024/frame).
+#   (2) google/siglip2-large-patch16-256 HF 다운로드(현재 캐시 없음 — 네트워크 필요, UNVERIFIED).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+  dense_cache_dir: /data2/clip_ws_cache/dense_full/siglip2_256   # HDD (SSD 93% full)
+
+anchor:                          # pooled ζ_g 채널 = C1 기질
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true               # ★ζ_f 쿼리 초기화 텍스트 임베딩에 필수
+  wrist_token: true
+  f4:                            # ★C1 fine 채널 (cowork D1–D4)
+    enable: true
+    K: 8                         # D1 토큰 수
+    bottleneck_dim: 96           # D1 연속 병목(64~128d)
+    query_init: text             # D2 (SigLIP2-pooled 자기질의 금지 §0)
+    gate: tanh                   # D2 붕괴 방어 (α=0 init, Flamingo)
+    d_attn: 768
+    heads: 8
+    flow_steps: 6
+    dense:                       # D0 patch ΔF 소스 = 동일 백본(siglip2-large-256)
+      name: siglip2
+      model_dir: google/siglip2-large-patch16-256
+      projection: joint
+      normalize: false
+      camera: agentview_rgb
+
+loss:
+  lat: 0.5                       # ζ_g CFM
+  act: 1.0                       # FLD 디코딩 (frozen h + gated fine 잔차)
+  wm: 0.0
+  f_cfm: 0.5                     # ζ_f 생성 flow CFM
+  consist: 0.1                   # L_consistency (ζ_f → pooled 변위)
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_c1.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_c1}

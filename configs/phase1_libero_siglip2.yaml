@@ -1,0 +1,58 @@
+# Phase 1 (LIBERO 트랙) — SigLIP2 앵커 head-to-head (vs CLIP 베이스라인)
+# ══════════════════════════════════════════════════════════════════════════
+# FAIRNESS 결정: NATIVE-BEST (각 앵커를 그 특성 최적점에서 — 백본만 스왑하되
+#   normalize는 앵커 native 최적을 사용). configs/phase1_libero.yaml을 그대로
+#   미러링하고 anchor 섹션 + checkpoint/run_name/헤더만 변경. 나머지(data·chunk·
+#   loss·hidden·layers·epochs·seed·scheduler)는 CLIP 레시피와 동일.
+#
+# normalize=false 근거 (EVIDENCE-BASED, 추측 아님):
+#   • E1 실측 (docs/upgrade_ledger.md:67-70): "SigLIP2 승자 norm=false dz(87) >
+#     norm=true dz(81)". 예측(norm=true 유리)은 반증됨. SigLIP2 native best(87)
+#     > CLIP native best(80). → SigLIP2는 norm=false에서 특성 최적.
+#   • 사용자 우려("이전 SigLIP2가 특성-인지/최적 설정이었나")를 직접 해소:
+#     norm=true는 E1에서 6pt 열위 = 잠재적 오설정. norm=false 채택.
+#   • 공정성 원칙 (docs/COWORK_DIRECTION_post-F3_2026-07-09.md:24-26): 텍스트
+#     채널 분리 1:1 앵커 스왑, 공정 후보=RADIO/SigLIP2. 1차 지표=언어 축
+#     (paraphrase·correct−wrong·t2a), SR은 near-null 예상(§0.5, pooled 앵커).
+# projection=joint: SigLIP2는 joint(공유 공간)만 지원 (anchor.py:97-98, pre 예외).
+# latent_dim은 anchor.dim(1152)으로 train_phase1.py:92-93에서 자동 설정 (아래 768은
+#   무시됨 — CLIP 레시피 미러링 위해 유지).
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8               # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2            # 비율 — 500 데모 중 100 (태스크 혼합 무작위)
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb   # 앵커 cache_key로 자동 분리
+
+anchor:
+  name: siglip2
+  projection: joint            # 공유 공간만 지원 (anchor.py:97-98)
+  normalize: false             # NATIVE-BEST — E1: norm=false dz(87)>norm=true(81)
+
+model:
+  latent_dim: 768              # train_phase1.py:92-93가 anchor.dim(1152)으로 자동 덮어씀
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_siglip2.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_siglip2}

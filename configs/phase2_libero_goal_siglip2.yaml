@@ -1,0 +1,59 @@
+# Phase 2 (LIBERO 트랙, GOAL 스위트) — SigLIP2 앵커 (F1 축: paraphrase, prediction-2)
+# ══════════════════════════════════════════════════════════════════════════
+# phase2_libero_goal.yaml(캠페인 승자: flow+past+손목캠+d1536)을 그대로 미러링,
+#   anchor 섹션 + phase1_ckpt/checkpoint/run_name/헤더만 변경. module·loss·
+#   d_model=1536·layers·seed 등은 CLIP goal 레시피와 동일.
+# anchor는 phase1과 동일해야 함 — phase2 train + rollout이 get_anchor(cfg)로 메인
+#   이미지/텍스트 인코더를 타고, lang cache가 anchor cache_key로 키됨(768d CLIP vs
+#   1152d SigLIP2 오염 방지). anchor 누락 시 CLIP 폴백 → phase1(SigLIP2)과 불일치.
+# normalize=false 근거: E1 실측 SigLIP2 norm=false dz(87)>norm=true(81)
+#   (docs/upgrade_ledger.md:67-70). 상세는 phase1_libero_goal_siglip2.yaml 헤더 참조.
+# d_model=1536은 flow 트랜스포머 폭 — anchor.dim(latent_dim=1152)과 별개, 무충돌.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_goal_siglip2.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_goal
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb  # ★손목캠 토큰 (+26pp) — module.wrist_token과 세트
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_goal_emb   # 앵커 cache_key로 자동 분리
+
+anchor:
+  name: siglip2
+  projection: joint            # 공유 공간만 지원 (anchor.py:97-98)
+  normalize: false             # NATIVE-BEST — phase1과 동일 (E1 근거)
+
+module:
+  name: flow                   # ★생성형 헤드 (mlp 대비 +29pp) — CFM+FLD
+  flow_source: past            # 수송 출발점 = g(A_past) (A2A식) — noise/vision 대비 일관 승
+  flow_steps: 6                # Euler 적분 (12 무이득)
+  source_noise: 0.1
+  d_model: 1536                # ★용량 (1024 대비 +6pp, 2048은 포화)
+  layers: 4                    # v_net 잔차블록
+  ctx_layers: 2                # ctx 인코더 블록 (4는 무이득)
+  lang_token: true             # 멀티태스크 언어 조건화 (필수)
+  wrist_token: true            # ★손목캠 5번째 토큰
+
+loss:
+  lat: 0.5                     # flow에선 CFM 가중 (1.0은 무이득)
+  act: 1.0                     # FLD 디코딩 액션 L1
+  wm: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2                      # 캠페인 승자 시드 (주의: 시드 분산 큼 — 최종 선택은 폐루프로)
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_goal_siglip2.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_goal_siglip2}

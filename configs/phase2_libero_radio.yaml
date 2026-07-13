@@ -1,0 +1,64 @@
+# Phase 2 (LIBERO 트랙) — RADIO 앵커 head-to-head (vs CLIP 베이스라인, F1)
+# ══════════════════════════════════════════════════════════════════════════
+# FAIRNESS 결정: NATIVE-BEST. configs/phase2_libero.yaml(캠페인 승자: flow+past+
+#   손목캠+d1536)을 그대로 미러링, anchor 섹션 + phase1_ckpt/checkpoint/run_name/
+#   헤더만 변경. module·loss·d_model=1536·layers·seed 등은 CLIP 레시피와 동일.
+# anchor는 phase1과 동일해야 함 — commit 7ad1950 이후 phase2 train + rollout이
+#   get_anchor(cfg)로 메인 이미지/텍스트 인코더를 타고 lang cache가 anchor
+#   cache_key로 키됨. anchor 누락 시 CLIP 폴백으로 phase1(RADIO)과 불일치.
+# normalize=false 근거: SigLIP2 정합(E1, upgrade_ledger.md:67-70) — RADIO summary가
+#   SigLIP2 타워 정렬(anchor.py:190). ⚠ RADIO 전용 스윕 UNVERIFIED. 상세는
+#   phase1_libero_radio.yaml 헤더 참조.
+# ⚠ RADIO FIX_RES=512 (anchor.py:221) — 이미지 인코딩이 512×512 so400m 배치 64
+#   (libero.py:97)로 캐시 생성 → CLIP(224/384) 대비 임베딩 캐시 단계 VRAM 상당.
+#   OOM 시 프레임 배치 축소 필요(코드 변경 — 이번 범위 밖). 해상도는 내부 처리.
+# d_model=1536은 flow 트랜스포머 폭 — anchor.dim(latent_dim≈1536)과 우연히 같으나
+#   개념상 별개 축, 무충돌 (latent_dim=AE in/out, d_model=v_net 폭).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_radio.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb  # ★손목캠 토큰 (+26pp) — module.wrist_token과 세트
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb   # 앵커 cache_key로 자동 분리
+
+anchor:
+  name: radio
+  projection: joint            # 어댑터 정렬 공간만 (anchor.py:224-225)
+  normalize: false             # NATIVE-BEST(SigLIP2 정합, E1) — phase1과 동일
+
+module:
+  name: flow                   # ★생성형 헤드 (mlp 대비 +29pp) — CFM+FLD
+  flow_source: past            # 수송 출발점 = g(A_past) (A2A식) — noise/vision 대비 일관 승
+  flow_steps: 6                # Euler 적분 (12 무이득)
+  source_noise: 0.1
+  d_model: 1536                # ★용량 (1024 대비 +6pp, 2048은 포화)
+  layers: 4                    # v_net 잔차블록
+  ctx_layers: 2                # ctx 인코더 블록 (4는 무이득)
+  lang_token: true             # 멀티태스크 언어 조건화 (필수)
+  wrist_token: true            # ★손목캠 5번째 토큰
+
+loss:
+  lat: 0.5                     # flow에선 CFM 가중 (1.0은 무이득)
+  act: 1.0                     # FLD 디코딩 액션 L1
+  wm: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2                      # 캠페인 승자 시드 (주의: 시드 분산 큼 — 최종 선택은 폐루프로)
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_radio.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_radio}

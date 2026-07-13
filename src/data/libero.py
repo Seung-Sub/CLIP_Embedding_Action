@@ -10,13 +10,38 @@ CLIP 텍스트 임베딩을 캐시한다 (저장만 — 정책 사용은 이후 
 """
 import os
 import re
+import zlib
 from pathlib import Path
 
 import h5py
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 HZ = 20.0
+
+
+def _wrist_augment(arr, rng):
+    """Exp2 학습용 약~중 photometric/geometric 증강 (동결 인코딩 전 이미지에 적용).
+
+    복구 스펙(P2 +aug arm): 밝기/대비/색 ±0.2, p=0.5 GaussianBlur r0.5-1.5,
+    p=0.5 회전 ±5°+0.9 center-crop-zoom, p=0.5 gaussian noise σ8.
+    손목캠·3인칭 공용. 동료 복구본(siglip_ref_libero.py)과 동일.
+    """
+    img = Image.fromarray(arr)
+    img = ImageEnhance.Brightness(img).enhance(1 + rng.uniform(-0.2, 0.2))
+    img = ImageEnhance.Contrast(img).enhance(1 + rng.uniform(-0.2, 0.2))
+    img = ImageEnhance.Color(img).enhance(1 + rng.uniform(-0.2, 0.2))
+    if rng.rand() < 0.5:
+        img = img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.5, 1.5)))
+    if rng.rand() < 0.5:
+        deg = rng.uniform(-5, 5); w, h = img.size
+        img = img.rotate(deg, resample=Image.BILINEAR)
+        cw, ch = int(w * 0.9), int(h * 0.9); l, t = (w - cw) // 2, (h - ch) // 2
+        img = img.crop((l, t, l + cw, t + ch)).resize((w, h), Image.BILINEAR)
+    a = np.asarray(img).astype(np.float32)
+    if rng.rand() < 0.5:
+        a = a + rng.normal(0, 8.0, a.shape)          # σ≈0.03×255 (학습은 약하게)
+    return np.clip(a, 0, 255).astype(np.uint8)
 
 
 class LiberoDataset:
@@ -35,6 +60,12 @@ class LiberoDataset:
             d.get("dense_cache_dir", str(self.cache_dir / "dense"))))
         self.span = max(2, int(round(self.chunk_sec * HZ)))
         self.stride = max(1, self.span // 8)
+        # Exp2 both-aug (P2). data.augment={view:N, wrist:N}. 없거나 0이면 완전
+        # 무증강 → build_policy_samples 출력이 기존과 byte-identical (핵심 불변식).
+        # N>0이면 해당 카메라 Z가 (T,N,D) variant 뱅크로(variant0=클린) 확장된다.
+        aug = d.get("augment") or {}
+        self.aug_view = int(aug.get("view", 0) or 0)
+        self.aug_wrist = int(aug.get("wrist", 0) or 0)
 
     # ---------- 에피소드 열거: (파일, demo키) ----------
 
@@ -121,6 +152,47 @@ class LiberoDataset:
         np.savez_compressed(cache, D=D)
         return D
 
+    # ---------- Exp2 both-aug: M-variant 증강 임베딩 뱅크 ----------
+
+    def _aug_cache(self, ep, camera, clip, variants):
+        """증강 variant 뱅크 캐시 경로. 클린 캐시(_emb_cache)와 파일명 분리
+        (_aug{M}), 앵커 cache_key 하위 디렉터리 규약은 _emb_cache와 동일 →
+        클린 캐시 절대 미변경(가드레일)."""
+        fname = self._key(ep) + f"_{camera}_aug{variants}.npz"
+        key = getattr(clip, "cache_key", None)
+        if key is None or key == "clip-vit-l-14/joint/norm":
+            return self.cache_dir / fname
+        d = self.cache_dir / key
+        d.mkdir(parents=True, exist_ok=True)
+        return d / fname
+
+    def cam_aug_embeddings(self, clip, ep, camera, variants=3):
+        """카메라 M-variant 증강 임베딩 뱅크 <key>_<cam>_aug{M}.npz — (T, M, D).
+
+        variant0 = 클린(=embeddings() 결과, 오늘 캐시 그대로 재사용 → variant0가
+        기존 임베딩과 정확히 동일). 1..M-1 = 동결 인코더 통과 전 이미지 증강본.
+        에피소드×카메라별 결정적 RNG(crc32(key+camera)) → 재현·카메라별 독립.
+        복구본(siglip_ref_libero.py) 스킴 미러: m=0은 rng 미소비, m>=1이 순서대로
+        rng 소비. 클린 캐시 미변경.
+        """
+        cache = self._aug_cache(ep, camera, clip, variants)
+        if cache.exists():
+            return np.load(cache)["Z"]
+        Z0 = self.embeddings(clip, ep, camera)           # (T, D) 클린 == variant0
+        frames = self.load_frames(ep, camera)            # (T,H,W,3) uint8
+        rng = np.random.RandomState(
+            zlib.crc32((self._key(ep) + camera).encode()) & 0xffffffff)
+        vs = [Z0]
+        for _m in range(1, int(variants)):
+            imgs = [Image.fromarray(_wrist_augment(f, rng)) for f in frames]
+            Z = []
+            for i in range(0, len(imgs), 64):
+                Z.append(clip.encode_images(imgs[i:i + 64])["embeds"])
+            vs.append(np.concatenate(Z))
+        Z = np.stack(vs, axis=1)                         # (T, M, D)
+        np.savez_compressed(cache, Z=Z)
+        return Z
+
     def instruction_embedding(self, clip, ep):
         path, _ = ep
         # 앵커별 텍스트 공간 분리(CLIP 768d vs SigLIP2 1152d). CLIP joint/norm은
@@ -165,19 +237,29 @@ class LiberoDataset:
                 print(f"  {self._key(ep)}: T={T}, pairs {len(starts)}")
         return out
 
-    def build_policy_samples(self, clip, files=None, stride=2, obs_anchors=None):
+    def build_policy_samples(self, clip, files=None, stride=2, obs_anchors=None,
+                             f4_anchor=None):
         """연속 윈도우 삼중쌍 (경계 포함 — 롤아웃 부트스트랩 분포 커버).
 
         obs_anchors: [(name, anchor, camera), ...] (F3 obs-fusion). 주어지면 각
         관측 앵커의 dense patch 토큰 D_cur[t] (Zc와 동일 starts 정렬)을 손목캠
         배열 뒤에 순서대로 덧붙인다. None(기본)이면 출력은 기존과 완전 동일.
+
+        f4_anchor: (anchor, camera) (C1/F4 fine 채널). 주어지면 patch ΔF =
+        D[t+span] − D[t] (동일 인덱스 patch 차분, agentview 정적 카메라 전제 — D0)를
+        (n, P, dense_dim)로 맨 뒤에 덧붙인다. None(기본)이면 출력 불변.
+
+        Exp2 both-aug (data.augment): aug_view=N/aug_wrist=N>0이면 해당 카메라
+        Z를 (n, M, D) variant 뱅크로 반환(variant0=클린). 둘 다 0(기본)이면 아래
+        else 경로만 타 출력이 기존과 완전 동일(byte-identical). 학습측 variant
+        선택은 train_phase2가 담당(train=샘플별 랜덤, val/eval=variant0).
         """
+        view_aug, wrist_aug = self.aug_view, self.aug_wrist
         files = files or self.episode_files()
         out = []
         for ep in files:
             acts = self.load_actions(ep)
             T = len(acts)
-            Z = self.embeddings(clip, ep)
             starts = list(range(0, T - self.span, stride))
 
             def past_seg(t):
@@ -185,20 +267,37 @@ class LiberoDataset:
                     return np.repeat(acts[0:1], 2, axis=0)
                 return acts[max(t - self.span, 0):t]
 
-            Zp = np.stack([Z[max(t - self.span, 0)] for t in starts])
-            Zc = np.stack([Z[t] for t in starts])
-            Zn = np.stack([Z[t + self.span] for t in starts])
+            if view_aug:                             # 3인칭 증강 뱅크 (T,M,D)
+                Za = self.cam_aug_embeddings(clip, ep, self.camera,
+                                             variants=view_aug)
+                Zp = np.stack([Za[max(t - self.span, 0)] for t in starts])  # (n,M,D)
+                Zc = np.stack([Za[t] for t in starts])
+                Zn = np.stack([Za[t + self.span] for t in starts])
+            else:
+                Z = self.embeddings(clip, ep)
+                Zp = np.stack([Z[max(t - self.span, 0)] for t in starts])
+                Zc = np.stack([Z[t] for t in starts])
+                Zn = np.stack([Z[t + self.span] for t in starts])
             Ap = np.stack([self.resample_chunk(past_seg(t)).ravel()
                            for t in starts])
             Af = np.stack([self.resample_chunk(acts[t:t + self.span]).ravel()
                            for t in starts])
             arrs = [Zp, Zc, Zn, Ap, Af]
             if self.wrist_camera:                    # 6번째: 손목캠 z_t (정책 토큰용)
-                Zw = self.embeddings(clip, ep, self.wrist_camera)
-                arrs.append(np.stack([Zw[t] for t in starts]))
+                if wrist_aug:
+                    Zw = self.cam_aug_embeddings(clip, ep, self.wrist_camera,
+                                                 variants=wrist_aug)          # (T,M,D)
+                    arrs.append(np.stack([Zw[t] for t in starts]))           # (n,M,D)
+                else:
+                    Zw = self.embeddings(clip, ep, self.wrist_camera)
+                    arrs.append(np.stack([Zw[t] for t in starts]))
             for _name, anchor, cam in (obs_anchors or []):   # F3: 관측 앵커별 dense
                 D = self.dense_embeddings(anchor, ep, cam)   # [T, P, d]
                 arrs.append(np.stack([D[t] for t in starts]))
+            if f4_anchor is not None:                        # C1/F4: patch ΔF (동일인덱스 차분)
+                f4_anc, f4_cam = f4_anchor
+                D = self.dense_embeddings(f4_anc, ep, f4_cam)   # [T, P, d]
+                arrs.append(np.stack([D[t + self.span] - D[t] for t in starts]))
             out.append(tuple(x.astype(np.float32) for x in arrs))
         return out
 

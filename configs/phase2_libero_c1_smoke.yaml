@@ -1,0 +1,67 @@
+# Phase 2 — C1/F4 CODE SMOKE (코드경로 점검용, C1 기질 아님).
+# ══════════════════════════════════════════════════════════════════════════
+# 목적: siglip2-large-256 기질(phase1 AE·dense 캐시·HF 다운로드) 부재 상태에서
+#   f4 코드경로만 검증. 대체 기질:
+#     • pooled ζ_g = CLIP phase1_libero.pt (768d, 존재)
+#     • dense ΔF   = DINOv2-reg 캐시 (256 patch × 1024d — siglip2-large-256과 그리드/차원 동형,
+#                    데모0/1 캐시 존재 → 다운로드/인코딩 0)
+#   → ζ_f 인코더 build, cross-attn, tanh-gate, ζ_f flow, L_consistency, fine 잔차 검증.
+#   실제 C1 학습은 configs/phase2_libero_c1.yaml (siglip2-large-256) 사용.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: true
+    K: 8
+    bottleneck_dim: 96
+    query_init: text
+    gate: tanh
+    d_attn: 768
+    heads: 8
+    flow_steps: 6
+    dense:                       # 대체 dense (그리드/차원 동형 stand-in)
+      name: dinov2
+      model_dir: facebook/dinov2-with-registers-large
+      camera: agentview_rgb
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.5
+  consist: 0.1
+
+train:
+  batch_size: 128
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 50
+  epochs: 3
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_c1_smoke.pt
+
+wandb: {enabled: false, project: clipvp, mode: online, run_name: phase2_libero_c1_smoke}

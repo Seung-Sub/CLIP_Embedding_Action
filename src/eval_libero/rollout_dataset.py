@@ -87,10 +87,60 @@ def load_models(cfg, device):
         latent_dim=p1["model"]["latent_dim"]).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
     wrist_cam = ck2["config"]["data"].get("wrist_camera") if use_wrist else None
-    # obs_anchors/obs_fusion 는 obs일 때만 non-None; no-obs 호출부는 무시(*_)한다.
+
+    # ---- C1/F4 fine 채널 (module.f4.enable + 체크포인트에 f4 state 존재 시에만) ----
+    # f4 is None 이면 롤아웃의 fine 경로가 완전 게이트됨 → pooled-only와 비트 동형.
+    # dense(patch ΔF)/text 차원은 저장 가중치에서 직접 도출 → 추론 시 dense 인코더 로드
+    # 불필요(ζ_f는 base 조건 noise-flow로 생성되며 미래 patch ΔF를 쓰지 않음).
+    f4 = None
+    f4_cfg = m.get("f4")
+    if f4_cfg and f4_cfg.get("enable") and ck2.get("f4") is not None:
+        from models.f4 import build_f4_from_cfg
+        fsd = ck2["f4"]
+        n_base = 3 + int(use_lang) + int(use_wrist)    # f4 flow 조건 = base 토큰
+        f4 = build_f4_from_cfg(
+            f4_cfg,
+            dense_dim=fsd["kv_proj.weight"].shape[1],   # dense patch 차원(학습 인코더)
+            text_dim=fsd["text_q.weight"].shape[1],     # 쿼리 초기화 텍스트 차원
+            latent_dim=p1["model"]["latent_dim"],
+            n_base_tokens=n_base, action_dim=ck1["action_dim"],
+            n_chunk=ck1["n_chunk"], n_patch=fsd["pos_emb"].shape[0])
+        f4.load_state_dict(fsd, strict=True)
+        f4 = f4.to(device).eval()
+
+    # obs_anchors/obs_fusion/f4 는 해당 모듈일 때만 non-None; no-obs·no-f4 호출부는 *_로 무시.
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, obs_anchors, obs_fusion)
+            wrist_cam, obs_anchors, obs_fusion, f4)
+
+
+def sample_zeta(policy, f4, tokens, generator=None):
+    """ζ_g (정책) + (f4 있으면) ζ_f 를 하나의 적분 루프·공유 τ로 함께 샘플.
+
+    cowork §D3-A 조건②: ζ_g flow와 ζ_f flow는 별개의 독립 적분이 아니라 단일
+    통합 샘플링 루프에서 동일 τ 스케줄로 전진해야 한다. 두 속도장은 서로의 현재
+    상태에 의존하지 않으므로(각자 ctx·x만) 통합 루프의 결과는 각자 독립 적분과
+    수치적으로 동일하며, 학습부(train_phase2)의 순차 2-루프와도 전송의미 동등.
+
+    f4 is None 이면 policy 단독 샘플(policy.forward)과 완전히 동일한 호출 → 비트 동형.
+    """
+    if f4 is None:
+        return policy(tokens), None                     # 현행 호출과 동일 = 비트 동형
+    assert policy.steps == f4.flow_steps, (
+        f"shared-τ 요구: policy.steps({policy.steps}) == "
+        f"f4.flow_steps({f4.flow_steps})")
+    base_flat = tokens.flatten(1)                       # C1: tokens == base(관측 없음)
+    ctx_g = policy.ctx(base_flat)
+    x_g = policy._x0(tokens, generator)                 # source=past → a_emb(RNG 무소비)
+    ctx_f = f4.ctx(base_flat)                           # ζ_f 조건 = 동일 base 토큰
+    x_f = torch.randn((len(tokens), f4.zf_dim), device=tokens.device,
+                      generator=generator) * f4.zf_std  # ζ_f source=noise(미래 무접근)
+    dt = 1.0 / policy.steps
+    for i in range(policy.steps):                       # 단일 루프 · 공유 τ = i·dt
+        t = torch.full((len(x_g), 1), i * dt, device=x_g.device)
+        x_g = x_g + policy._v(x_g, ctx_g, t) * dt
+        x_f = x_f + f4._v(x_f, ctx_f, t) * dt
+    return x_g, x_f
 
 
 def main():
@@ -103,7 +153,7 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam, obs_anchors, obs_fusion) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
 

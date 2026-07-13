@@ -1,0 +1,60 @@
+# Phase 1 (LIBERO 트랙) — RADIO 앵커 head-to-head (vs CLIP 베이스라인, F1)
+# ══════════════════════════════════════════════════════════════════════════
+# FAIRNESS 결정: NATIVE-BEST. configs/phase1_libero.yaml을 그대로 미러링, anchor
+#   섹션 + checkpoint/run_name/헤더만 변경. 나머지는 CLIP 레시피와 동일.
+# RADIO = C-RADIOv4-SO400M + siglip2-g 어댑터 (다중교사 증류 "리치 앵커", 언어정렬
+#   summary 보존) — cowork 방향 2a/F1 (docs/COWORK_ADJUDICATION_F3_narrative:24,
+#   COWORK_DIRECTION_post-F3:24). 1차 지표=언어 축, SR near-null 예상(§0.5).
+#
+# normalize=false 근거:
+#   • RADIO summary는 SigLIP2 텍스트 타워와 같은 공간에 정렬 (anchor.py:190-204)
+#     → SigLIP2 계열 특성 공유. SigLIP2 native-best가 norm=false(E1, offline 87 vs
+#     81, upgrade_ledger.md:67-70)이므로 RADIO도 norm=false를 native 가설로 채택.
+#   • RADIO 텍스트 인코더도 encode_text(normalize=False)로 호출됨(anchor.py:266) —
+#     정규화를 _post로 이연 = norm=false가 어댑터 native 사용에 정합.
+#   • ⚠ UNVERIFIED: RADIO 전용 norm 스윕은 E-series에 없음(SigLIP2만). SigLIP2
+#     정합 근거 기반 결정 — 반증 시 norm=true 재시도. SR near-null이어도 백본
+#     열위 결론 금지(§0.5, COWORK_DIRECTION_post-F3:25).
+# 입력 해상도(FIX_RES=512, 16px 배수, center-crop 없음)는 RadioAnchor 내부에서
+#   처리 (anchor.py:221,236 get_nearest_supported_resolution) — config 노브 불필요.
+# projection=joint: RADIO는 어댑터 정렬 공간만 (anchor.py:224-225, pre 예외).
+# latent_dim은 anchor.dim(~1536, 런타임 확정)으로 train_phase1.py:92-93 자동 설정.
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8               # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2            # 비율 — 500 데모 중 100 (태스크 혼합 무작위)
+  cache_dir: ~/clip_ws/outputs/cache/libero_emb   # 앵커 cache_key로 자동 분리
+
+anchor:
+  name: radio
+  projection: joint            # 어댑터 정렬 공간만 (anchor.py:224-225)
+  normalize: false             # NATIVE-BEST(SigLIP2 정합, E1) — UNVERIFIED for RADIO
+
+model:
+  latent_dim: 768              # train_phase1.py:92-93가 anchor.dim(~1536)으로 자동 덮어씀
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_radio.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_radio}

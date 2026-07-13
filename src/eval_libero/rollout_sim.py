@@ -30,7 +30,7 @@ from PIL import Image
 from core import chunkrep
 from core.anchor import get_anchor
 from data.libero import LiberoDataset
-from eval_libero.rollout_dataset import load_models
+from eval_libero.rollout_dataset import load_models, sample_zeta
 
 
 def main():
@@ -46,13 +46,17 @@ def main():
                     help="env 렌더 상하반전 (실측: 데모와 동일 방향 — 기본 off)")
     ap.add_argument("--save-video", type=int, default=0)
     ap.add_argument("--instruction-mode",
-                    choices=["correct", "wrong", "blank", "swap"],
+                    choices=["correct", "wrong", "blank", "swap", "v1", "v4"],
                     default="correct",
                     help="언어 사용 판별(§0.6 R2): correct(정상)/wrong(다른 태스크 지시문)/"
                          "blank(빈 문자열)/swap(1c: 같은 씬 내 타깃-스왑 — bowl_2를 가리키는 "
                          "형제 태스크 지시문). swap에서는 instructed/orig/neither 3율을 보고")
     ap.add_argument("--checkpoint", default=None,
                     help="cfg train.checkpoint 덮어쓰기 (시드/변형 롤아웃 — 별도 config 불요)")
+    ap.add_argument("--ablate-zf", action="store_true", default=False,
+                    help="병목-효능 프로브(C1 게이트): f4 로드 시 fine 채널 ζ_f 기여를 0으로 "
+                         "만들어 pooled(ζ_g)만으로 롤아웃. 미지정 시 현행과 비트 동형. "
+                         "SR(full C1) vs SR(--ablate-zf) 로 ζ_f 기여 확인.")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -63,7 +67,7 @@ def main():
         cfg["train"]["checkpoint"] = args.checkpoint
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam, obs_anchors, obs_fusion) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion, f4) = load_models(cfg, device)
     ds = LiberoDataset(cfg)          # span/resample 재사용
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     span, H = ds.span, args.exec_horizon
@@ -89,7 +93,14 @@ def main():
             return suite.get_task((tid + n_tasks // 2) % n_tasks).language
         if args.instruction_mode == "swap":
             return suite.get_task(SWAP[tid]).language
-        return suite.get_task(tid).language
+        # ICBench식 문자열 교란(씬/코드 불변, 지시문만): 성공기준은 원 태스크(done) 그대로 →
+        # LGS = SR(correct) − SR(교란). 언어 무시 정책이면 SR 유지, 사용 정책이면 하락.
+        base = suite.get_task(tid).language
+        if args.instruction_mode == "v1":        # 속성 치환: black→white (씬에 white bowl 없음 = 모순)
+            return base.replace("black", "white")
+        if args.instruction_mode == "v4":        # 관계 치환: on→under (달성 불가 관계)
+            return base.replace(" on ", " under ")
+        return base
 
     videos_dir = WS / "outputs" / "eval" / "videos"
     results = {}
@@ -160,9 +171,16 @@ def main():
                            if wrist_cam else [])
                     if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
                         toks = toks + obs_toks(obs)
-                    zeta = policy(torch.stack(toks, dim=1))
+                    # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
+                    # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
+                    zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
+                    if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
+                        zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
+                    ahat_lat = ae.h(zeta, zc)             # frozen h(ζ_g, z_cur) = pooled 채널
+                    if f4 is not None:                   # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
+                        ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
                     ahat = chunkrep.from_repr(
-                        ae.h(zeta, zc).cpu().numpy()[0], repr_kind) \
+                        ahat_lat.cpu().numpy()[0], repr_kind) \
                         * a_std + a_mean
                     ahat = np.clip(ahat, -1.0, 1.0)
                     infer_ms.append((time.time() - t0) * 1000)

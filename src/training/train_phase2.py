@@ -105,7 +105,6 @@ def main():
     obs_cfg = m_cfg.get("obs")
     obs_anchors, enc_dims, enc_names = None, {}, []
     if obs_cfg:
-        from core.anchor import get_anchor
         obs_anchors = []
         for enc in obs_cfg["encoders"]:
             anc = get_anchor({"anchor": enc})
@@ -115,9 +114,22 @@ def main():
             enc_dims[enc["name"]] = anc.patch_dim     # dinov2=1024 / siglip2=1152
             enc_names.append(enc["name"])
 
+    # ---- C1/F4 fine 채널 (module.f4.enable 있을 때만; 없으면 아래 경로 전부 no-op = 비트 동형) ----
+    f4_cfg = m_cfg.get("f4")
+    f4_on = bool(f4_cfg and f4_cfg.get("enable"))
+    f4_anchor = None
+    if f4_on:
+        assert not obs_cfg, "module.f4 와 module.obs 는 동시 사용 불가 (C1 = 단일 dense 채널)"
+        assert m_cfg.get("name") == "flow", "F4 fine flow 는 flow 정책 전제"
+        de = f4_cfg["dense"]                          # dense ΔF 앵커 (siglip2-large-256 = C1 기질)
+        f4_dense_anc = get_anchor({"anchor": de})
+        if de["name"] == "siglip2":
+            f4_dense_anc.save_tokens = True
+        f4_anchor = (f4_dense_anc, de.get("camera", "agentview_rgb"))
+
     print("삼중쌍 구성 중 (임베딩 캐시 재사용)...")
     eps = ds.build_policy_samples(clip, files, stride=cfg["data"].get("stride", 2),
-                                  obs_anchors=obs_anchors)
+                                  obs_anchors=obs_anchors, f4_anchor=f4_anchor)
 
     def stack(ids):
         return tuple(np.concatenate([eps[i][k] for i in ids])
@@ -134,11 +146,24 @@ def main():
     n_wrist = 1 if ds.wrist_camera else 0
     W_tr = Wx_tr[0] if use_wrist else None
     W_va = Wx_va[0] if use_wrist else None
-    Dobs_tr = Wx_tr[n_wrist:] if obs_cfg else []      # 인코더별 dense [N,P,d]
-    Dobs_va = Wx_va[n_wrist:] if obs_cfg else []
+    # 인코더별 dense [N,P,d]. obs=F3 관측 인코더들 / f4=단일 patch ΔF (맨 뒤 1개).
+    Dobs_tr = Wx_tr[n_wrist:] if (obs_cfg or f4_on) else []
+    Dobs_va = Wx_va[n_wrist:] if (obs_cfg or f4_on) else []
+
+    # ---- Exp2 both-aug: variant 뱅크 처리 (data.augment on일 때만) ----
+    # build_policy_samples가 (N, M, D) 뱅크를 주면: val/eval은 항상 variant0(클린),
+    # train은 forward_train에서 샘플별 랜덤 variant를 뽑는다(zp/zc/zn 일관).
+    # augment off면 모든 배열이 2D → 아래 _v0/pick 모두 no-op (기존과 완전 동일).
+    def _v0(x):
+        return x[:, 0] if x is not None and getattr(x, "ndim", 0) == 3 else x
+    Zp_va, Zc_va, Zn_va = _v0(Zp_va), _v0(Zc_va), _v0(Zn_va)
+    W_va = _v0(W_va)
+    Zc_tr0 = _v0(Zc_tr)                               # 클린 통계(x0_std)용 variant0
 
     # 언어 토큰 (멀티태스크 조건화): 에피소드별 지시문 임베딩을 샘플 수만큼 복제
     use_lang = m_cfg.get("lang_token", False)
+    if f4_on:
+        assert use_lang, "module.f4 는 쿼리 초기화용 텍스트 임베딩 필요 → lang_token=true 전제"
     if use_lang:
         lang_per_ep = [ds.instruction_embedding(clip, files[i])
                        for i in range(len(files))]
@@ -193,19 +218,44 @@ def main():
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
                                   latent_dim=p1["model"]["latent_dim"]).to(device)
     is_flow = isinstance(model, FlowPolicy)
+
+    # ---- C1/F4 fine 채널 (정책 뒤에 구성 → 정책 파라미터 RNG 소비 불변 = bit-identity) ----
+    f4 = None
+    if f4_on:
+        from models.f4 import build_f4_from_cfg
+        n_base = 3 + int(use_lang) + int(use_wrist)   # f4 flow 조건 = base 토큰(관측/미래 제외)
+        dense_dim = Dobs_tr[0].shape[-1]              # ΔF 마지막축 (siglip2-large-256=1024)
+        n_patch = Dobs_tr[0].shape[-2]                # 256 (16×16)
+        f4 = build_f4_from_cfg(f4_cfg, dense_dim=dense_dim, text_dim=L_tr.shape[1],
+                               latent_dim=p1["model"]["latent_dim"], n_base_tokens=n_base,
+                               action_dim=act_dim, n_chunk=n_chunk, n_patch=n_patch).to(device)
+        print(f"f4: K={f4.K}, bottleneck={f4.bneck}, ζ_f dim={f4.zf_dim}, "
+              f"dense ΔF={n_patch}×{dense_dim}, query_init=text, gate=tanh(α={float(f4.alpha):.1f})")
     if is_flow:                                   # x0 스케일 = 잠재 타깃 분포
         with torch.no_grad():
             lt = ae.g(torch.tensor(Cf_tr[:4096], device=device),
-                      torch.tensor(Zc_tr[:4096], device=device))
+                      torch.tensor(Zc_tr0[:4096], device=device))
         model.x0_std.fill_(lt.std().item())
         print(f"flow: source={model.source}, steps={model.steps}, "
               f"x0_std={model.x0_std.item():.4f}")
+    if f4_on:                                     # ζ_f flow source std = 게이트 전 병목 스케일
+        with torch.no_grad():
+            dF0 = torch.tensor(Dobs_tr[0][:2048], device=device)
+            l0 = torch.tensor(L_tr[:2048], device=device)
+            kv = f4.ln_kv(f4.kv_proj(dF0) + f4.pos_emb.unsqueeze(0))
+            q = f4.text_q(l0).unsqueeze(1) + f4.query_offset.unsqueeze(0)
+            o, _ = f4.attn(q, kv, kv)
+            zf_scale = f4.bottleneck(o).flatten(1).std().item()
+        f4.zf_std.fill_(max(zf_scale, 1e-2))
+        print(f"f4: ζ_f flow source std={f4.zf_std.item():.4f}, "
+              f"params {sum(p.numel() for p in f4.parameters())/1e6:.2f}M")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"policy[{m_cfg['name']}] params: {n_params/1e6:.2f}M "
           f"(d{m_cfg['d_model']}/L{m_cfg['layers']}/H{m_cfg.get('heads', 8)})")
     opt = torch.optim.Adam(
         list(model.parameters())
-        + (list(obs_fusion.parameters()) if obs_cfg else []),
+        + (list(obs_fusion.parameters()) if obs_cfg else [])
+        + (list(f4.parameters()) if f4_on else []),
         lr=t_cfg["lr"],
         betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
 
@@ -225,7 +275,7 @@ def main():
            else torch.zeros(len(Cf_va), 0, device=device)] \
         + [torch.tensor(d, device=device) for d in Dobs_va]
     epochs = 3 if args.smoke else t_cfg["epochs"]
-    best_val, best_state, patience = np.inf, None, 0
+    best_val, best_state, best_f4, patience = np.inf, None, None, 0
 
     sched = None
     if t_cfg.get("scheduler") == "cosine":
@@ -239,9 +289,13 @@ def main():
             return 0.5 * (1 + np.cos(np.pi * min(prog, 1.0)))
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
+    lam_fcfm = w.get("f_cfm", 0.5)                    # C1/F4 손실 가중 (f4 off면 미사용)
+    lam_consist = w.get("consist", 0.1)
+
     def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs):
-        toks = [zp, zc, aemb] + ([lang] if use_lang else []) \
-            + ([wr] if use_wrist else [])
+        base = [zp, zc, aemb] + ([lang] if use_lang else []) \
+            + ([wr] if use_wrist else [])             # f4 flow 조건 = base 토큰 (미래 무접근)
+        toks = list(base)
         if obs_cfg:                                   # F3: 관측 토큰 K개를 열 끝에 추가
             obs_tok = obs_fusion({n: d for n, d in zip(enc_names, dobs)})  # (B,K,768)
             toks = toks + [obs_tok[:, k] for k in range(K)]
@@ -253,17 +307,38 @@ def main():
                 gen = torch.Generator(device=device); gen.manual_seed(0)
             with torch.no_grad():
                 lat_target = ae.g(cf, zc)
-            zeta, l_fm = model.fm_and_sample(toks, lat_target, generator=gen)
-            l_act = torch.nn.functional.l1_loss(ae.h(zeta, zc), cf)
+            zeta, l_fm = model.fm_and_sample(toks, lat_target, generator=gen)   # ζ̂_g (정책 무변경)
+            ahat = ae.h(zeta, zc)                      # frozen 디코딩 (pooled 채널)
             cos = torch.nn.functional.cosine_similarity
             l_wm = 0.5 * (1 - cos(zeta, zn - zc, dim=1)).mean()
+            parts = {}
+            if f4_on:                                 # ζ_f: 미래 ΔF에서 인코딩(타깃), flow로 생성
+                zeta_f_tgt = f4.encode(dobs[0], lang)            # (B, K*bneck), 초기 0(α=0)
+                zeta_f, l_f_fm = f4.flow_fm_and_sample(
+                    torch.cat(base, dim=1), zeta_f_tgt, generator=gen)
+                ahat = ahat + f4.fine_action(zeta, zeta_f, zc)  # gated 잔차(β=0 → 초기 0)
+                l_consist = f4.consistency(zeta_f_tgt, zn - zc)
+                parts.update(f_cfm=l_f_fm.item(), consist=l_consist.item())
+            l_act = torch.nn.functional.l1_loss(ahat, cf)
             total = w["lat"] * l_fm + w["act"] * l_act + w["wm"] * l_wm
-            return total, {"lat": l_fm.item(), "act": l_act.item(),
-                           "wm": l_wm.item()}
+            if f4_on:
+                total = total + lam_fcfm * l_f_fm + lam_consist * l_consist
+            parts.update(lat=l_fm.item(), act=l_act.item(), wm=l_wm.item())
+            return total, parts
         zeta = model(toks)
         return policy_losses(zeta, cf, zc, zn, ae, w)
 
     def forward_train(zp, zc, zn, cp, cf, lang, wr, *dobs):
+        if zp.dim() == 3:                             # Exp2 aug 뱅크: 샘플별 랜덤 variant
+            B, M = zp.shape[0], zp.shape[1]           # (zp/zc/zn 동일 m — 일관 뷰)
+            m = torch.randint(0, M, (B, 1, 1), device=zp.device)
+            zp = zp.gather(1, m.expand(-1, 1, zp.shape[2])).squeeze(1)
+            zc = zc.gather(1, m.expand(-1, 1, zc.shape[2])).squeeze(1)
+            zn = zn.gather(1, m.expand(-1, 1, zn.shape[2])).squeeze(1)
+        if wr.dim() == 3:                             # 손목캠 aug 뱅크: 독립 variant
+            Bw, Mw = wr.shape[0], wr.shape[1]
+            mw = torch.randint(0, Mw, (Bw, 1, 1), device=wr.device)
+            wr = wr.gather(1, mw.expand(-1, 1, wr.shape[2])).squeeze(1)
         if past_noise > 0:                            # 폐루프 오차 누적 모사
             cp = cp + torch.randn_like(cp) * past_noise
         with torch.no_grad():
@@ -275,6 +350,8 @@ def main():
         model.train()
         if obs_cfg:
             obs_fusion.train()
+        if f4_on:
+            f4.train()
         logs, parts_log = [], []
         for batch in loader:
             batch = [b.to(device) for b in batch]     # 7 base + K개 dense(obs일 때)
@@ -286,6 +363,8 @@ def main():
         model.eval()
         if obs_cfg:
             obs_fusion.eval()
+        if f4_on:
+            f4.eval()
         with torch.no_grad():
             val_loss, val_parts = forward(*val_t)
         val_loss = val_loss.item()
@@ -293,6 +372,8 @@ def main():
             best_val, patience = val_loss, 0
             best_state = {k: v.detach().cpu().clone()
                           for k, v in model.state_dict().items()}
+            best_f4 = ({k: v.detach().cpu().clone()
+                        for k, v in f4.state_dict().items()} if f4_on else None)
         else:
             patience += 1
         if wb:
@@ -309,14 +390,19 @@ def main():
             break
     print(f"학습 {time.time()-t0:.0f}s, best val {best_val:.4f}")
     model.load_state_dict(best_state)
+    if f4_on and best_f4 is not None:
+        f4.load_state_dict(best_f4)
 
     # ---- 평가 ----
     model.eval()
     if obs_cfg:
         obs_fusion.eval()
+    if f4_on:
+        f4.eval()
     with torch.no_grad():
-        toks = [val_t[0], val_t[1], val_t[3]] + ([val_t[5]] if use_lang else []) \
+        base = [val_t[0], val_t[1], val_t[3]] + ([val_t[5]] if use_lang else []) \
             + ([val_t[6]] if use_wrist else [])
+        toks = list(base)
         if obs_cfg:                                   # F3: 학습과 동일하게 관측 토큰 추가
             obs_tok = obs_fusion({n: d for n, d in zip(enc_names, val_t[7:])})
             toks = toks + [obs_tok[:, k] for k in range(K)]
@@ -325,7 +411,11 @@ def main():
         zeta = model(torch.stack(toks, dim=1), generator=gen) if is_flow \
             else model(torch.stack(toks, dim=1))
         lat_target = ae.g(val_t[4], val_t[1])
-        ahat = ae.h(zeta, val_t[1]).cpu().numpy()
+        ahat_t = ae.h(zeta, val_t[1])
+        if f4_on:                                     # ζ_f를 noise flow로 생성(폐루프 동형) + fine 잔차
+            zeta_f = f4.flow_sample(torch.cat(base, dim=1), generator=gen)
+            ahat_t = ahat_t + f4.fine_action(zeta, zeta_f, val_t[1])
+        ahat = ahat_t.cpu().numpy()
     zeta_np = zeta.cpu().numpy()
     lat_np = lat_target.cpu().numpy()
     wm_np = (val_t[2] - val_t[1]).cpu().numpy()
@@ -361,7 +451,8 @@ def main():
     ckpt_path = Path(os.path.expanduser(t_cfg["checkpoint"]))
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": best_state, "config": cfg, "metrics": metrics,
-                "obs_fusion": obs_fusion.state_dict() if obs_cfg else None},
+                "obs_fusion": obs_fusion.state_dict() if obs_cfg else None,
+                "f4": best_f4 if f4_on else None},
                ckpt_path)
     print(f"저장: {ckpt_path}")
     if args.tag:

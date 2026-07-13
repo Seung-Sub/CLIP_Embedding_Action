@@ -1,0 +1,47 @@
+# Phase 1 (LIBERO 트랙, GOAL 스위트) — SigLIP2 앵커 (F1 축: paraphrase, prediction-2)
+# ══════════════════════════════════════════════════════════════════════════
+# phase1_libero_goal.yaml(CLIP goal 레시피)을 그대로 미러링하고 anchor 섹션 +
+#   checkpoint/run_name/헤더만 변경. data(goal root/cache)·chunk·loss·hidden·
+#   layers·epochs·seed·scheduler는 CLIP goal 레시피와 동일.
+# normalize=false 근거 (E1 실측, docs/upgrade_ledger.md:67-70): SigLIP2 native-best
+#   norm=false dz(87)>norm=true dz(81). projection=joint: SigLIP2는 joint만 지원
+#   (anchor.py:97-98). latent_dim은 미설정 — anchor.dim(1152)으로 train_phase1.py:93
+#   에서 자동 설정.
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_goal
+  camera: agentview_rgb
+  chunk_sec: 0.8               # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2            # 비율 — 500 데모 중 100 (태스크 혼합 무작위)
+  cache_dir: ~/clip_ws/outputs/cache/libero_goal_emb   # 앵커 cache_key로 자동 분리
+
+anchor:
+  name: siglip2
+  projection: joint            # 공유 공간만 지원 (anchor.py:97-98)
+  normalize: false             # NATIVE-BEST — E1: norm=false dz(87)>norm=true(81)
+
+model:
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_goal_siglip2.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_goal_siglip2}
