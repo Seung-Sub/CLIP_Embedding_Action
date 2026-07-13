@@ -1,0 +1,58 @@
+# Phase 2 — SigLIP2-large-256 pooled-ONLY baseline (C1 gate의 paired-CI 대조군).
+# ══════════════════════════════════════════════════════════════════════════
+# C1(f4 2채널)과 동일 phase1(large-256)·동일 FlowPolicy·동일 하이퍼 — 차이는 f4.enable=false 하나뿐.
+# 즉 ζ = ζ_g(pooled Δ)만. dense 캐시 불요(pooled cache 재사용) → 빠른 학습.
+# 용도: 폐루프 게이트에서 C1(f4) vs 이 pooled-only 를 paired bootstrap CI(src/analysis/paired_ci.py)로 비교.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # ★격리 (so400m 1152d cache-key 충돌 방지)
+
+anchor:                          # C1과 동일 기질 (pooled ζ_g)
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false                # ★pooled-only: fine 채널 없음 (C1과의 유일한 차이)
+
+loss:
+  lat: 0.5                        # ζ_g CFM
+  act: 1.0                        # FLD 디코딩 (frozen h)
+  wm: 0.0
+  f_cfm: 0.0                      # f4 없음
+  consist: 0.0                    # f4 없음
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_siglip2_large256.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_siglip2_large256}

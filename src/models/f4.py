@@ -15,6 +15,17 @@
   없으므로, base 토큰(z_prev,z_cur,g(A_past),lang,wrist) 조건의 작은 conditional flow가
   noise→ζ_f 로 생성(D3-A "ζ_f source=noise"). 폐루프 롤아웃은 이 flow_sample을 사용.
 
+fine_mode (C1 게이트 ablation 팔; module.f4.fine_mode, 기본 'kquery'):
+  • 'kquery'   = 현행 학습 K=8-쿼리 cross-attention readout(위 D2). 기본값 · 무변경 · bit-identical.
+  • 'paramfree'= A1 팔(docs/A1_size_gate_probe_2026-07-13.md). 선별=무학습(shortcut 통로 0):
+       readout = concat[ pool(ΔF)(D) ; patchnorm(P)=per-patch‖ΔF‖ ] → 단일 Linear → 96d 병목.
+       이 사영 1개가 readout의 유일한 학습 파라미터(선별/attention 자체는 파라미터-0).
+  ★ 두 모드는 오직 ζ_f READOUT(=encode)만 다르고 그 뒤(병목·tanh게이트 α=0·생성 flow·
+    fine_action·L_consistency)는 완전히 동일하다. READOUT은 phase1-encode(학습 타깃)
+    시점에만 존재하며(실제 ΔF 보유), 추론(rollout sample_zeta)은 encode를 부르지 않고
+    flow로 ζ̂_f를 생성하므로 paramfree도 kquery와 정확히 같은 seam에 끼워진다.
+    paramfree는 K개 토큰이 없으므로 zf_dim = bottleneck_dim(96); kquery는 K*bottleneck(768).
+
 DEVIATION LEDGER (cowork §D 대비):
   D3-A 원문은 "[ζ_g;ζ_f] concat 단일 벡터에 공유 τ flow(신규 모듈 0)". 그러나 v_net을 넓히면
   RNG 소비·상태 결합으로 ζ̂_g가 초기부터 달라져 요구된 bit-identity(enabled@init=pooled 불변)를
@@ -31,23 +42,34 @@ from models.policy import ResidualBlock
 class F4FineChannel(nn.Module):
     def __init__(self, dense_dim, text_dim, latent_dim, n_base_tokens,
                  action_dim, n_chunk, n_patch=256, K=8, bottleneck_dim=96,
-                 d_attn=768, heads=8, flow_steps=6, d_flow=512, flow_layers=3):
+                 d_attn=768, heads=8, flow_steps=6, d_flow=512, flow_layers=3,
+                 fine_mode='kquery'):
         super().__init__()
+        self.fine_mode = fine_mode
         self.K, self.bneck = K, bottleneck_dim
         self.n_chunk, self.action_dim = n_chunk, action_dim
         self.flow_steps = flow_steps
-        self.zf_dim = K * bottleneck_dim
+        # paramfree: ζ_f = 단일 96d 병목(K개 토큰 없음) → zf_dim=bottleneck_dim.
+        # kquery(기본): K개 96d 병목 토큰 flatten → zf_dim=K*bottleneck_dim (현행 그대로).
+        self.zf_dim = bottleneck_dim if fine_mode == 'paramfree' else K * bottleneck_dim
 
-        # ---- ζ_f 인코더 (D2): 텍스트 초기화 K-쿼리 cross-attn over [ΔF + 2D pos-emb] ----
-        self.kv_proj = nn.Linear(dense_dim, d_attn)
-        # 2D 위치임베딩: 16×16 그리드 각 셀에 학습 임베딩(고정 격자이므로 patch당 1개 = 2D 인코딩과 동형)
-        self.pos_emb = nn.Parameter(torch.zeros(n_patch, d_attn))
-        self.ln_kv = nn.LayerNorm(d_attn)
-        self.text_q = nn.Linear(text_dim, d_attn)          # 쿼리 초기화 = 텍스트 임베딩 사영(§0: pooled 자기질의 금지)
-        self.query_offset = nn.Parameter(torch.zeros(K, d_attn))   # K개 쿼리 구분용 학습 오프셋
-        self.attn = nn.MultiheadAttention(d_attn, heads, batch_first=True)
-        self.bottleneck = nn.Linear(d_attn, bottleneck_dim)        # 저차원 연속 병목(D1)
-        self.alpha = nn.Parameter(torch.zeros(1))                  # tanh-gate α=0 (Flamingo, D2)
+        if fine_mode == 'paramfree':
+            # ---- A1 무학습 ζ_f readout (docs/A1_size_gate_probe): 선별=파라미터-0 ----
+            # readout = concat[ pool(ΔF)(dense_dim) ; patchnorm(n_patch)=per-patch‖ΔF‖ ]
+            #           → 단일 Linear → 96d 병목. 이 사영이 readout의 유일한 학습 파라미터.
+            self.readout = nn.Linear(dense_dim + n_patch, bottleneck_dim)
+            self.alpha = nn.Parameter(torch.zeros(1))              # tanh-gate α=0 (동일)
+        else:
+            # ---- ζ_f 인코더 (D2): 텍스트 초기화 K-쿼리 cross-attn over [ΔF + 2D pos-emb] ----
+            self.kv_proj = nn.Linear(dense_dim, d_attn)
+            # 2D 위치임베딩: 16×16 그리드 각 셀에 학습 임베딩(고정 격자이므로 patch당 1개 = 2D 인코딩과 동형)
+            self.pos_emb = nn.Parameter(torch.zeros(n_patch, d_attn))
+            self.ln_kv = nn.LayerNorm(d_attn)
+            self.text_q = nn.Linear(text_dim, d_attn)          # 쿼리 초기화 = 텍스트 임베딩 사영(§0: pooled 자기질의 금지)
+            self.query_offset = nn.Parameter(torch.zeros(K, d_attn))   # K개 쿼리 구분용 학습 오프셋
+            self.attn = nn.MultiheadAttention(d_attn, heads, batch_first=True)
+            self.bottleneck = nn.Linear(d_attn, bottleneck_dim)        # 저차원 연속 병목(D1)
+            self.alpha = nn.Parameter(torch.zeros(1))                  # tanh-gate α=0 (Flamingo, D2)
 
         # ---- ζ_f 생성 flow (noise → ζ_f), base 토큰 조건 (D3-A source=noise) ----
         cin = n_base_tokens * latent_dim
@@ -68,17 +90,28 @@ class F4FineChannel(nn.Module):
         # ---- L_consistency (D4): ζ_f → pooled 변위 Δp (ζ_f를 실제 변위에 묶음) ----
         self.consist = nn.Linear(self.zf_dim, latent_dim)
 
-        nn.init.normal_(self.pos_emb, std=0.02)
-        nn.init.normal_(self.query_offset, std=0.02)
+        if fine_mode != 'paramfree':
+            nn.init.normal_(self.pos_emb, std=0.02)
+            nn.init.normal_(self.query_offset, std=0.02)
 
-    # ---- 학습 타깃: 미래 patch ΔF에서 ζ_f 인코딩 ----
-    def encode(self, dF, text_emb):                # dF (B,P,dense_dim), text_emb (B,text_dim)
+    # ---- 게이트 전 ζ_f 병목 z (readout). 모드 분기 유일 지점. ----
+    def _readout(self, dF, text_emb):              # dF (B,P,dense_dim), text_emb (B,text_dim)
+        if self.fine_mode == 'paramfree':          # A1: 선별=파라미터-0, 사영 1개만 학습
+            pooled = dF.mean(dim=1)                 # (B, D)  전역 mean-pool(ΔF)
+            patchnorm = dF.norm(dim=2)              # (B, P)  per-patch ‖ΔF‖ (patchnorm 벡터)
+            return self.readout(torch.cat([pooled, patchnorm], dim=1))   # (B, bneck)
         kv = self.ln_kv(self.kv_proj(dF) + self.pos_emb.unsqueeze(0))
         q = self.text_q(text_emb).unsqueeze(1) + self.query_offset.unsqueeze(0)   # (B,K,d_attn)
         o, _ = self.attn(q, kv, kv)                # (B,K,d_attn)
-        z = self.bottleneck(o)                     # (B,K,bneck)
-        zf = torch.tanh(self.alpha) * z            # α=0 → 초기 0
-        return zf.flatten(1)                       # (B, K*bneck)
+        return self.bottleneck(o).flatten(1)       # (B, K*bneck)
+
+    # ---- 학습 타깃: 미래 patch ΔF에서 ζ_f 인코딩 (추론엔 미사용 — flow가 생성) ----
+    def encode(self, dF, text_emb):
+        return torch.tanh(self.alpha) * self._readout(dF, text_emb)     # α=0 → 초기 0
+
+    # ---- flow source(x0) 스케일 = 게이트 전 병목 std (train_phase2 zf_std 보정, 모드 무관) ----
+    def source_std(self, dF, text_emb):
+        return self._readout(dF, text_emb).std().item()
 
     # ---- ζ_f 생성 flow ----
     def _v(self, x, ctx, t):
@@ -128,4 +161,5 @@ def build_f4_from_cfg(f4, dense_dim, text_dim, latent_dim, n_base_tokens,
         bottleneck_dim=f4.get("bottleneck_dim", 96),
         d_attn=f4.get("d_attn", 768), heads=f4.get("heads", 8),
         flow_steps=f4.get("flow_steps", 6), d_flow=f4.get("d_flow", 512),
-        flow_layers=f4.get("flow_layers", 3))
+        flow_layers=f4.get("flow_layers", 3),
+        fine_mode=f4.get("fine_mode", "kquery"))    # C1 ablation 팔 (기본 kquery=현행)

@@ -242,10 +242,7 @@ def main():
         with torch.no_grad():
             dF0 = torch.tensor(Dobs_tr[0][:2048], device=device)
             l0 = torch.tensor(L_tr[:2048], device=device)
-            kv = f4.ln_kv(f4.kv_proj(dF0) + f4.pos_emb.unsqueeze(0))
-            q = f4.text_q(l0).unsqueeze(1) + f4.query_offset.unsqueeze(0)
-            o, _ = f4.attn(q, kv, kv)
-            zf_scale = f4.bottleneck(o).flatten(1).std().item()
+            zf_scale = f4.source_std(dF0, l0)     # 게이트 전 병목 std (fine_mode 무관)
         f4.zf_std.fill_(max(zf_scale, 1e-2))
         print(f"f4: ζ_f flow source std={f4.zf_std.item():.4f}, "
               f"params {sum(p.numel() for p in f4.parameters())/1e6:.2f}M")

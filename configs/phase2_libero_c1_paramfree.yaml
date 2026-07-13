@@ -1,15 +1,10 @@
-# Phase 2 — C1 / F4 계층 2채널 액션코드 (cowork §D, D0–D5). SigLIP2-large-256 단독 백본.
+# Phase 2 — C1 / F4 ablation 팔 A1: 파라미터-0 ζ_f readout (fine_mode=paramfree).
 # ══════════════════════════════════════════════════════════════════════════
-# ζ = [ζ_g ⊕ ζ_f]:  ζ_g = pooled Δ(현행 FlowPolicy, 무변경) / ζ_f = patch ΔF fine 채널(module.f4).
-# module.f4 없으면 이 파일과 무관하게 pooled-only와 비트 동형(gate 뒤 무영향).
-#
-# ★선행 요건 (현재 미존재 — 착수 전 생성 필요):
-#   (0) phase1 AE(siglip2-large-256, 1024d):
-#       - configs/phase1_libero_siglip2.yaml 를 복사해 anchor.model_dir=google/siglip2-large-patch16-256
-#         (patch16@256 → 16×16=256 patch, 1024d) 로 바꿔 phase1 학습 →
-#         checkpoints/phase1_libero_siglip2_large256.pt
-#   (1) dense ΔF 캐시: 첫 phase2 실행이 dense_embeddings로 자동 생성(HDD /data2). 대용량(≈256×1024/frame).
-#   (2) google/siglip2-large-patch16-256 HF 다운로드(현재 캐시 없음 — 네트워크 필요, UNVERIFIED).
+# phase2_libero_c1.yaml 의 클론. 유일 차이: module.f4.fine_mode: paramfree + 체크포인트/run_name.
+# ζ_f readout = concat[ pool(ΔF) ; patchnorm(256) ] → 단일 Linear → 96d 병목 (선별=학습 0).
+# 나머지(병목·tanh게이트 α=0·생성 flow·fine_action·L_consistency)는 kquery 팔과 동일.
+# 근거: docs/A1_size_gate_probe_2026-07-13.md — 오프라인 readout 동급/우위 + F3-shortcut 통로 제거.
+# C1 폐루프 게이트가 이 팔(A1) vs phase2_libero_c1.yaml(kquery) 을 비교한다.
 # ══════════════════════════════════════════════════════════════════════════
 phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
 
@@ -22,7 +17,7 @@ data:
   n_chunk: 16
   stride: 2
   val_episodes: 0.2
-  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # ★격리 (generic dir는 so400m 1152d와 cache-key 충돌 → 1024d 격리 필수)
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # ★격리 (so400m 1152d cache-key 충돌 방지)
   dense_cache_dir: /data2/clip_ws_cache/dense_full/siglip2_256   # HDD (SSD 93% full)
 
 anchor:                          # pooled ζ_g 채널 = C1 기질
@@ -43,9 +38,10 @@ module:
   wrist_token: true
   f4:                            # ★C1 fine 채널 (cowork D1–D4)
     enable: true
-    K: 8                         # D1 토큰 수
-    bottleneck_dim: 96           # D1 연속 병목(64~128d)
-    query_init: text             # D2 (SigLIP2-pooled 자기질의 금지 §0)
+    fine_mode: paramfree         # ★A1 팔: 파라미터-0 selection readout (기본 kquery 아님)
+    K: 8                         # D1 토큰 수 (paramfree에선 미사용 — zf_dim=bottleneck_dim)
+    bottleneck_dim: 96           # D1 연속 병목(64~128d) — paramfree ζ_f 차원 = 96
+    query_init: text             # D2 (paramfree readout엔 텍스트 미사용 — A1 text-reweight not-run)
     gate: tanh                   # D2 붕괴 방어 (α=0 init, Flamingo)
     d_attn: 768
     heads: 8
@@ -74,6 +70,6 @@ train:
   early_stop_patience: 20
   seed: 2
   past_noise: 0.05
-  checkpoint: ~/clip_ws/checkpoints/phase2_libero_c1.pt
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_c1_paramfree.pt
 
-wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_c1}
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_c1_paramfree}

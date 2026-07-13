@@ -98,13 +98,25 @@ def load_models(cfg, device):
         from models.f4 import build_f4_from_cfg
         fsd = ck2["f4"]
         n_base = 3 + int(use_lang) + int(use_wrist)    # f4 flow 조건 = base 토큰
-        f4 = build_f4_from_cfg(
-            f4_cfg,
-            dense_dim=fsd["kv_proj.weight"].shape[1],   # dense patch 차원(학습 인코더)
-            text_dim=fsd["text_q.weight"].shape[1],     # 쿼리 초기화 텍스트 차원
-            latent_dim=p1["model"]["latent_dim"],
-            n_base_tokens=n_base, action_dim=ck1["action_dim"],
-            n_chunk=ck1["n_chunk"], n_patch=fsd["pos_emb"].shape[0])
+        fine_mode = f4_cfg.get("fine_mode", "kquery")
+        if fine_mode == "paramfree":
+            # A1 팔: readout.weight (bneck, dense_dim+n_patch). encode는 추론에 미사용이나
+            # strict 로드 위해 shape 재현 필요. paramfree는 dense_dim/n_patch를 개별로 쓰지
+            # 않고 합(=readout 입력)만 쓰므로 dense_dim=합·n_patch=0 로 동형 재구성.
+            f4 = build_f4_from_cfg(
+                f4_cfg,
+                dense_dim=fsd["readout.weight"].shape[1], text_dim=1,
+                latent_dim=p1["model"]["latent_dim"],
+                n_base_tokens=n_base, action_dim=ck1["action_dim"],
+                n_chunk=ck1["n_chunk"], n_patch=0)
+        else:
+            f4 = build_f4_from_cfg(
+                f4_cfg,
+                dense_dim=fsd["kv_proj.weight"].shape[1],   # dense patch 차원(학습 인코더)
+                text_dim=fsd["text_q.weight"].shape[1],     # 쿼리 초기화 텍스트 차원
+                latent_dim=p1["model"]["latent_dim"],
+                n_base_tokens=n_base, action_dim=ck1["action_dim"],
+                n_chunk=ck1["n_chunk"], n_patch=fsd["pos_emb"].shape[0])
         f4.load_state_dict(fsd, strict=True)
         f4 = f4.to(device).eval()
 

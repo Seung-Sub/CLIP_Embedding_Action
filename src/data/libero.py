@@ -142,14 +142,20 @@ class LiberoDataset:
         d = (self.dense_cache_dir / key) if key else self.dense_cache_dir
         cache = d / (self._key(ep) + f"_{camera}.npz")
         if cache.exists():
-            return np.load(cache)["D"]
+            try:
+                return np.load(cache)["D"]
+            except Exception:
+                cache.unlink(missing_ok=True)   # 손상/부분 기록 캐시 → 아래서 재생성 (self-healing)
         d.mkdir(parents=True, exist_ok=True)
         frames = [Image.fromarray(im) for im in self.load_frames(ep, camera)]
         D = []
         for i in range(0, len(frames), 64):
             D.append(clip.encode_images(frames[i:i + 64])["tokens"])
         D = np.concatenate(D)
-        np.savez_compressed(cache, D=D)
+        tmp = cache.with_name(cache.name + ".tmp")     # 원자적 기록: crash 시 부분파일이 최종 경로에 남지 않도록
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(fh, D=D)
+        tmp.replace(cache)
         return D
 
     # ---------- Exp2 both-aug: M-variant 증강 임베딩 뱅크 ----------
