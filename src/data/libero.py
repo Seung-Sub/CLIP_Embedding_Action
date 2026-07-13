@@ -121,7 +121,11 @@ class LiberoDataset:
         camera = camera or self.camera
         cache = self._emb_cache(ep, camera, clip)
         if cache.exists():
-            return np.load(cache)["Z"]
+            Z = np.load(cache)["Z"]
+            _dim = getattr(clip, "dim", None)   # cowork §3: 캐시키 충돌(model-agnostic id) 즉시 검출
+            assert _dim is None or Z.shape[-1] == _dim, \
+                f"pooled cache dim {Z.shape[-1]} != anchor.dim {_dim} ({cache}) — cache-key 충돌?"
+            return Z
         frames = [Image.fromarray(im) for im in self.load_frames(ep, camera)]
         Z = []
         for i in range(0, len(frames), 64):
@@ -142,10 +146,16 @@ class LiberoDataset:
         d = (self.dense_cache_dir / key) if key else self.dense_cache_dir
         cache = d / (self._key(ep) + f"_{camera}.npz")
         if cache.exists():
+            D = None
             try:
-                return np.load(cache)["D"]
+                D = np.load(cache)["D"]
             except Exception:
                 cache.unlink(missing_ok=True)   # 손상/부분 기록 캐시 → 아래서 재생성 (self-healing)
+            if D is not None:
+                _dim = getattr(clip, "dim", None)   # cowork §3: 차원불일치(캐시키 충돌)는 loud fail (재생성으로 숨기지 않음)
+                assert _dim is None or D.shape[-1] == _dim, \
+                    f"dense cache dim {D.shape[-1]} != anchor.dim {_dim} ({cache}) — cache-key 충돌?"
+                return D
         d.mkdir(parents=True, exist_ok=True)
         frames = [Image.fromarray(im) for im in self.load_frames(ep, camera)]
         D = []
