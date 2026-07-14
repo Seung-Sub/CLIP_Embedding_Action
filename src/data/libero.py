@@ -193,7 +193,10 @@ class LiberoDataset:
         """
         cache = self._aug_cache(ep, camera, clip, variants)
         if cache.exists():
-            return np.load(cache)["Z"]
+            try:
+                return np.load(cache)["Z"]
+            except Exception:
+                cache.unlink(missing_ok=True)   # 손상/부분 기록(동시 arm race) → 아래서 재생성 (self-healing)
         Z0 = self.embeddings(clip, ep, camera)           # (T, D) 클린 == variant0
         frames = self.load_frames(ep, camera)            # (T,H,W,3) uint8
         rng = np.random.RandomState(
@@ -206,7 +209,10 @@ class LiberoDataset:
                 Z.append(clip.encode_images(imgs[i:i + 64])["embeds"])
             vs.append(np.concatenate(Z))
         Z = np.stack(vs, axis=1)                         # (T, M, D)
-        np.savez_compressed(cache, Z=Z)
+        tmp = cache.with_name(cache.name + ".tmp")       # 원자적 기록(동시 arm race 시 부분파일 방지)
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(fh, Z=Z)
+        tmp.replace(cache)
         return Z
 
     def instruction_embedding(self, clip, ep):
