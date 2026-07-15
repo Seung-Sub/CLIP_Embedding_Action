@@ -1,0 +1,87 @@
+# Phase 2 — C2-FULL FLAGSHIP (cowork §1). SigLIP2-large-256 pooled ζ_g ⊕ DINOv3-L/16 patch ΔF ζ_f.
+# ══════════════════════════════════════════════════════════════════════════
+# ζ = [ζ_g ⊕ ζ_f]:
+#   ζ_g = SigLIP2-large-256 pooled Δ (언어정렬, 현행 FlowPolicy 무변경 — C1과 동일 phase1 AE 재사용).
+#   ζ_f = DINOv3-L/16 patch ΔF (16×16 그리드 정합), 텍스트-쿼리 K=8 cross-attention + 96d 연속 병목
+#         + tanh-gate, ζ_f flow 분기(공유 τ, D3-A).
+# ★w_consistency = 0 (loss.consist: 0.0) — 구조절제 판정(C1) 반영, 재도입 금지(구조적 교훈:
+#   계층채널 결합손실이 ζ_f를 coarse Δp로 붕괴시켜 게이트 미개방 유발).
+# ★규제 스택 전체: both-aug 3-variant(agentview+wrist) + projector dropout 0.2 + source/past noise.
+#
+# 대조군: configs/phase2_libero_c2_control.yaml (pooled-only large256 + 동일 규제, f4.enable=false).
+#         → fine 채널(DINOv3 ζ_f)의 순수 기여 격리.
+#
+# 선행요건 (착수 전 확인): (0) phase1 large256 AE ✓존재. (1) DINOv3 dense 캐시 = 1-pass 사전생성
+#   (§2.2 해상도 결정 반영). (2) large256 pooled 캐시 ✓존재. (3) both-aug 뱅크 = 첫 실행 or 사전생성.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256        # ζ_g pooled (SigLIP2-large256, 1024d 격리)
+  dense_cache_dir: /data2/clip_ws_cache/dense_c2_dinov3            # ★DINOv3 dense 전용 (cache_key로 해상도/pool 추가 분리)
+  augment:                                                        # ★규제: both-aug 3-variant
+    view: 3                                                       # agentview 3-variant 뱅크
+    wrist: 3                                                      # wrist 3-variant 뱅크
+
+anchor:                          # pooled ζ_g 채널 = 언어정렬 기질 (C1/large256와 동일)
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1              # ★규제: source noise
+  dropout: 0.2                   # ★규제: projector(ctx)+v_net dropout
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true               # ★ζ_f 쿼리 초기화 텍스트 임베딩에 필수
+  wrist_token: true
+  f4:                            # ★C2 fine 채널 (DINOv3 ζ_f)
+    enable: true
+    K: 8                         # D1 토큰 수
+    bottleneck_dim: 96           # D1 연속 병목
+    query_init: text             # D2 (pooled 자기질의 금지 §0)
+    gate: tanh                   # D2 붕괴 방어 (α=0 init, Flamingo)
+    d_attn: 768
+    heads: 8
+    flow_steps: 6
+    fine_mode: kquery            # 학습 K-쿼리 cross-attention readout (현행)
+    dense:                       # D0 patch ΔF 소스 = DINOv3-L/16 (언어정렬 SigLIP2와 다른 기질)
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      normalize: false           # raw patch(ΔF 규약)
+      force_size: 256            # §2.2 해상도 결정 반영 (256 = 16×16 그리드 정합; FALLBACK 시 512 + pool_to:16)
+      camera: agentview_rgb
+
+loss:
+  lat: 0.5                       # ζ_g CFM
+  act: 1.0                       # FLD 디코딩 (frozen h + gated fine 잔차)
+  wm: 0.0
+  f_cfm: 0.5                     # ζ_f 생성 flow CFM
+  consist: 0.0                   # ★w_consistency = 0 (재도입 금지)
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05               # ★규제: past noise (폐루프 오차누적 모사)
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_c2.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_c2}

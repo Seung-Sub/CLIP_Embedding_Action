@@ -186,6 +186,73 @@ class Dinov2Anchor(BaseAnchor):
                 "tokens": out.last_hidden_state[:, sl:].float().cpu().numpy()}
 
 
+class Dinov3Anchor(BaseAnchor):
+    """DINOv3-L/16 — 무언어 dense 앵커 (C2 fine 채널 ζ_f 기질, cowork §1/§2).
+
+    native 규율 (W5 model-usage 감사 준수):
+      • own norms / do_center_crop=False → 전체 프레임 정사각 no-crop resize.
+      • registers 드롭: last_hidden = [CLS, R개 register, 패치…] → [:, 1+R:] (DINOv3-L R=4).
+      • fp32 고정: DINOv3 patch 토큰은 fp16에서 NaN(W5 검증) → 항상 float32.
+      • tokens = raw patch(ΔF 규약, SigLIP2 dense와 동일 — L2-norm 안 함).
+      • has_text=False: 텍스트 쿼리는 메인 SigLIP2 앵커가 제공(dense 앵커는 patch만).
+
+    해상도/그리드 (사전등록 §2.2 결정에 따라 config로 선택):
+      • force_size=256 → 256/16 = 16×16 = 256 patch (SigLIP2-large-256 그리드 정합).
+      • force_size=512, pool_to=16 → 32×32 인코딩 후 2×2 adaptive-avg-pool → 16×16 (FALLBACK:
+        DINOv3 dense-optimum 보존 + 그리드 정합). 두 경로 모두 n_patch=256·dim=1024.
+    cache_key = id(해상도+pool 판)/pre/raw → 해상도·pool별 dense 캐시 완전 분리.
+    """
+    has_text = False
+    patch_dim = 1024
+
+    def __init__(self, projection="pre", normalize=False, model_dir=None,
+                 force_size=256, pool_to=None):
+        super().__init__("pre", normalize)             # joint 공간 없음 → pre 고정
+        from transformers import AutoImageProcessor, AutoModel
+        src = model_dir or "facebook/dinov3-vitl16-pretrain-lvd1689m"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # fp32 고정 (fp16 → NaN patch tokens, W5 검증). device 무관 항상 fp32.
+        self.model = AutoModel.from_pretrained(src, dtype=torch.float32
+                                               ).to(self.device).eval()
+        self.n_reg = int(getattr(self.model.config, "num_register_tokens", 0) or 0)
+        self.n_prefix = 1 + self.n_reg                 # CLS + register/storage tokens
+        self.patch = self.model.config.patch_size
+        self.force_size = int(force_size)
+        self.pool_to = int(pool_to) if pool_to else None
+        self.grid = self.force_size // self.patch      # 256/16=16 · 512/16=32
+        assert self.grid * self.patch == self.force_size, \
+            f"force_size {self.force_size} not divisible by patch {self.patch}"
+        # no-crop 전체 프레임 정사각 resize (W5 DinoEncoder 미러 = 검증된 경로)
+        self._size = {"height": self.force_size, "width": self.force_size}
+        self.processor = AutoImageProcessor.from_pretrained(
+            src, do_center_crop=False, size=self._size, do_resize=True)
+        self.dim = self.model.config.hidden_size       # 1024
+        self.dim_text = None
+        out_grid = self.pool_to or self.grid
+        self.n_patch = out_grid * out_grid             # 256 (grid-match, 두 경로 동일)
+        self.id = f"dinov3-vitl16-{self.force_size}"
+        if self.pool_to:
+            self.id += f"-pool{self.pool_to}"          # 별도 dense 캐시 키
+
+    @torch.no_grad()
+    def encode_images(self, pil_images):
+        import torch.nn.functional as F
+        toks = []
+        for i in range(0, len(pil_images), 16):        # OOM 안전 서브배치 (512 fp32)
+            inp = self.processor(images=pil_images[i:i + 16], return_tensors="pt",
+                                 size=self._size).to(self.device)
+            out = self.model(pixel_values=inp["pixel_values"].to(self.model.dtype))
+            t = out.last_hidden_state[:, self.n_prefix:, :]     # drop CLS+regs → (B,P,1024)
+            if self.pool_to:                            # FALLBACK: g×g → pool_to×pool_to avg-pool
+                B, _P, D = t.shape
+                g = self.grid
+                x = t.reshape(B, g, g, D).permute(0, 3, 1, 2)          # (B,D,g,g)
+                x = F.adaptive_avg_pool2d(x, (self.pool_to, self.pool_to))
+                t = x.permute(0, 2, 3, 1).reshape(B, self.pool_to * self.pool_to, D)
+            toks.append(t.float().cpu().numpy().astype(np.float32))
+        return {"embeds": None, "tokens": np.concatenate(toks, 0)}
+
+
 class RadioAnchor(BaseAnchor):
     """C-RADIOv4-SO400M + SigLIP2 어댑터 — 언어 정렬 "리치 앵커" (F1, cowork 방향 2a).
 
@@ -268,7 +335,7 @@ class RadioAnchor(BaseAnchor):
 
 
 _REGISTRY = {"clip": ClipAnchor, "siglip2": Siglip2Anchor, "dinov2": Dinov2Anchor,
-             "radio": RadioAnchor}
+             "dinov3": Dinov3Anchor, "radio": RadioAnchor}
 
 
 def get_anchor(cfg=None):
@@ -278,11 +345,15 @@ def get_anchor(cfg=None):
     name = a.get("name", "clip")
     if name not in _REGISTRY:
         raise KeyError(f"unknown anchor '{name}' (지원: {sorted(_REGISTRY)})")
-    kwargs = {"projection": a.get("projection", "joint" if name != "dinov2" else "pre"),
-              "normalize": a.get("normalize", True)}
+    _pre = name in ("dinov2", "dinov3")               # 무언어 = joint 공간 없음 → pre 고정
+    kwargs = {"projection": a.get("projection", "pre" if _pre else "joint"),
+              "normalize": a.get("normalize", False if name == "dinov3" else True)}
     if name == "clip":
         return ClipAnchor(**kwargs, cfg=cfg)
     if name == "dinov2":
         kwargs["pooled"] = a.get("pooled", "cls")
         kwargs["center_crop"] = a.get("center_crop", False)   # 기본 = no-crop (v2 보정)
+    if name == "dinov3":                              # C2 dense: 해상도/pool은 §2.2 결정 반영
+        kwargs["force_size"] = a.get("force_size", 256)
+        kwargs["pool_to"] = a.get("pool_to")          # None=native grid / 16=512→16×16 fallback
     return _REGISTRY[name](**kwargs, model_dir=a.get("model_dir"))
