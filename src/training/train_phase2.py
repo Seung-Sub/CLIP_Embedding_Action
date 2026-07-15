@@ -80,7 +80,15 @@ def main():
                  p1["model"]["dropout"],
                  p1["model"].get("state_cond", True),
                  p1["model"].get("decoder_state_cond"),
-                 p1["model"].get("encoder_state_cond")).to(device)
+                 p1["model"].get("encoder_state_cond"),
+                 # hybrid/direct phase1(HY03)은 InfoNCE logit_scale(+contrast_proj) 파라미터를
+                 # 가지므로 동일 인자로 재구성해야 state_dict 로드됨. dz면 전부 no-op(기존 동형).
+                 align_mode=p1["model"].get("align_mode", "dz"),
+                 contrast_w=float(p1.get("loss", {}).get("contrast", 0.0)),
+                 contrast_loss=p1["model"].get("contrast_loss", "infonce"),
+                 contrast_head=p1["model"].get("contrast_head", False),
+                 sigmoid_bias0=p1["model"].get("sigmoid_bias0", -5.5),
+                 align_block=p1["model"].get("align_block")).to(device)
     ae.load_state_dict(ck["state_dict"])
     ae.eval()
     for p in ae.parameters():

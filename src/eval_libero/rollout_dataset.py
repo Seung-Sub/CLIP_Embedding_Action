@@ -50,7 +50,14 @@ def load_models(cfg, device):
                  p1["model"]["dropout"],
                  p1["model"].get("state_cond", True),
                  p1["model"].get("decoder_state_cond"),
-                 p1["model"].get("encoder_state_cond")).to(device).eval()
+                 p1["model"].get("encoder_state_cond"),
+                 # hybrid phase1(HY03) logit_scale 파라미터 정합 — dz면 no-op(기존 동형).
+                 align_mode=p1["model"].get("align_mode", "dz"),
+                 contrast_w=float(p1.get("loss", {}).get("contrast", 0.0)),
+                 contrast_loss=p1["model"].get("contrast_loss", "infonce"),
+                 contrast_head=p1["model"].get("contrast_head", False),
+                 sigmoid_bias0=p1["model"].get("sigmoid_bias0", -5.5),
+                 align_block=p1["model"].get("align_block")).to(device).eval()
     ae.load_state_dict(ck1["state_dict"])
     ck2 = torch.load(os.path.expanduser(cfg["train"]["checkpoint"]),
                      map_location="cpu", weights_only=False)
