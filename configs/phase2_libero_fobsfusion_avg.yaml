@@ -1,0 +1,74 @@
+# Phase 2 — F-OBS-FUSION Arm A (avg-fusion): 관측-레벨 dual 융합 (SigLIP2-L256 ⊕ DINOv3-L), f4 disabled.
+# ══════════════════════════════════════════════════════════════════════════
+# cowork §3-2 Arm A: 외부(SigLIP/src/core/dual_wrapper.py:75-82)의 E3 avg 공식을 우리 regime에
+#   포팅 — 단, DINOv2 → DINOv3(vitl16)로 스왑(§3-2 지정). anchor=dualfusion:
+#     z = L2norm( 0.5*L2norm(SigLIP2-L256 pooled) + 0.5*L2norm(DINOv3-vitl16 pooled CLS) ), 1024-d.
+#   텍스트=SigLIP2 텍스트타워(언어정렬 성분 보존). dim=1024 불변 → 하류 폭 변경 없음.
+# 대조군 phase2_libero_c2_control.yaml 과 규제/eval 완전 동일 (both-aug 3-variant + projector
+#   dropout 0.2 + source/past noise), 차이는 anchor(단일 SigLIP2 → dualfusion) 뿐. f4.enable=false.
+#
+# ★선행요건 — phase1 DeltaAE REFIT 필수:
+#   phase1 는 anchor pooled z 를 target 공간으로 학습(train_phase1.py:92-93 latent_dim=anchor.dim).
+#   fused z(1024) 는 단일 SigLIP2 z 와 다른 분포 → 아래 phase1_ckpt 를 반드시 재학습해야 함:
+#     python src/training/train_phase1.py --config configs/phase1_libero_fobsfusion_avg.yaml
+#   (그 config 의 anchor 블록 = 아래와 동일. latent_dim 은 1024 로 자동 설정됨.)
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_avg.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_avg   # 앵커 cache_key(dualfusion-...)로 자동 분리
+  augment:                                                         # ★c2_control과 동일 규제 (both-aug 3-variant)
+    view: 3
+    wrist: 3
+
+anchor:                          # Arm A: 관측-레벨 avg-fusion
+  name: dualfusion
+  projection: joint
+  normalize: true                # 공식 최종 L2norm → 출력 unit (avg판 스케일 교정)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m   # GATED(Meta license) — 계정 승인 필요, 없으면 dinov2-large 로 대체
+  alpha: 0.5                     # DINO 가중 (0.5 = 외부 E3 literal mean)
+  force_size: 256                # DINOv3 256/16 = 16×16 (SigLIP2-L256 그리드 정합)
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1              # ★c2_control과 동일 규제
+  dropout: 0.2                   # ★c2_control과 동일 규제
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false                # ★pooled-only 융합: fine 채널 없음 (c2_control과 동일)
+
+loss:
+  lat: 0.5                        # ζ_g CFM
+  act: 1.0                        # FLD 디코딩 (frozen h)
+  wm: 0.0
+  f_cfm: 0.0                      # f4 없음
+  consist: 0.0                    # f4 없음
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05               # ★c2_control과 동일 규제
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_fobsfusion_avg.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_fobsfusion_avg}

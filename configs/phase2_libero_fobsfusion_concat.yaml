@@ -1,0 +1,80 @@
+# Phase 2 — F-OBS-FUSION Arm B (no-mix concat): 관측-레벨 concat 융합 (SigLIP2-L256 ⊕ DINOv3-L), f4 disabled.
+# ══════════════════════════════════════════════════════════════════════════
+# cowork §3-2 Arm B: 두 pooled 특징을 섞지 않고 이어붙임. anchor=dualconcat:
+#     z = concat([ L2norm(SigLIP2-L256 pooled), L2norm(DINOv3-vitl16 pooled CLS) ]) → 2048-d.
+#   (concat 은 재정규화 안 함 — 각 서브블록 unit 유지가 no-mix 취지. anchor.py DualConcatAnchor 주석 참조.)
+#   텍스트=SigLIP2 서브블록(첫 1024-d)만 → 언어정렬은 SigLIP2 블록 대상 (§3-2).
+# 대조군 phase2_libero_c2_control.yaml 과 규제/eval 완전 동일 (both-aug 3-variant + dropout 0.2
+#   + source/past noise), 차이는 anchor(dualconcat, 2048-d) 뿐. f4.enable=false.
+#
+# ★★ REVIEW REQUIRED — lang 토큰 폭 불일치 (착수 전 코드 hook 필요):
+#   z(=zp/zc/wrist/aemb) 는 2048-d 인데 lang 토큰(SigLIP2 텍스트)은 1024-d.
+#   train_phase2.py:299 는 base=[zp,zc,aemb,lang,wrist] 를 torch.stack(균일폭) 으로 결합 →
+#   폭 불일치로 이 arm 은 현재 그대로 실행 시 stack 에서 실패함.
+#   해법(코드 리뷰 대상, 본 준비에서는 미수정): lang(1024) 을 2048 lang 토큰의 SigLIP2
+#   서브블록(첫 1024-d)에 배치(DINO 절반 0패딩)하거나 lang→2048 projection 추가.
+#   → §3-2 "언어정렬은 SigLIP2 블록 대상" 과 정확히 일치하는 삽입점. lang_token 은 c2_control
+#   매칭 위해 true 유지(언어 성분 보존). 이 hook 확정 전까지 phase2 학습 착수 금지.
+#
+# ★선행요건 — phase1 DeltaAE REFIT 필수 (concat z=2048 은 별도 target 분포):
+#     python src/training/train_phase1.py --config configs/phase1_libero_fobsfusion_concat.yaml
+#   (latent_dim 은 2048 로 자동 설정됨 — train_phase1.py:92-93.)
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_concat.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # 앵커 cache_key(dualconcat-...)로 자동 분리
+  augment:                                                            # ★c2_control과 동일 규제 (both-aug 3-variant)
+    view: 3
+    wrist: 3
+
+anchor:                          # Arm B: 관측-레벨 no-mix concat
+  name: dualconcat
+  projection: joint
+  normalize: false               # concat 은 전역 재정규화 안 함 (서브블록 unit 유지)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m   # GATED — 계정 승인 필요, 없으면 dinov2-large 로 대체
+  force_size: 256                # DINOv3 256/16 = 16×16 (SigLIP2-L256 그리드 정합)
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1              # ★c2_control과 동일 규제
+  dropout: 0.2                   # ★c2_control과 동일 규제
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true               # ★언어 성분 보존 (단, 위 REVIEW hook 확정 필요)
+  wrist_token: true
+  f4:
+    enable: false                # ★pooled-only 융합: fine 채널 없음 (c2_control과 동일)
+
+loss:
+  lat: 0.5                        # ζ_g CFM
+  act: 1.0                        # FLD 디코딩 (frozen h)
+  wm: 0.0
+  f_cfm: 0.0                      # f4 없음
+  consist: 0.0                    # f4 없음
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05               # ★c2_control과 동일 규제
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_fobsfusion_concat.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_fobsfusion_concat}

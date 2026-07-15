@@ -334,8 +334,118 @@ class RadioAnchor(BaseAnchor):
         return {"embeds": self._post(emb), "tokens": None}
 
 
+class DualFusionAnchor(BaseAnchor):
+    """Arm A — 관측(anchor)-레벨 avg-fusion (외부 E3 dual_wrapper 공식의 DINOv3 판, cowork §3-2).
+
+    z = L2norm( (1-alpha)*L2norm(sig_pooled) + alpha*L2norm(dino_pooled) ),  alpha=0.5.
+      • sig 브랜치 = SigLIP2-large-256 pooled (get_image_features, 1024-d, joint 공유공간).
+      • dino 브랜치 = DINOv3-vitl16 pooled CLS (1024-d, fp32 고정). ← 외부는 DINOv2였음
+        (SigLIP/src/core/dual_wrapper.py:31 default facebook/dinov2-large — DINOv3 게이트 때문).
+      • 각 브랜치를 L2정규화 후 가중합, 합을 다시 L2정규화 ("두 unit의 평균은 unit이 아님"
+        스케일 교정 — 외부 주석 dual_wrapper.py:9-11). dim 불변(1024) → 하류 차원 변경 없음.
+    텍스트는 SigLIP2 텍스트타워로 위임(언어정렬 성분 보존; DINOv3는 텍스트 타워 없음).
+    외부 원본 공식: SigLIP/src/core/dual_wrapper.py:75-82 (verbatim, DINOv2 판).
+    로딩/전처리/native 규율은 기존 Siglip2Anchor·Dinov3Anchor 내부를 재사용(중복 회피).
+    """
+    has_text = True
+    patch_dim = None                                 # pooled-only fusion (dense 미노출)
+
+    def __init__(self, projection="joint", normalize=True, model_dir=None,
+                 siglip_dir=None, dino_dir=None, alpha=0.5, force_size=256):
+        if projection != "joint":
+            raise ValueError("dualfusion: projection=pre 미지원 (SigLIP2 공유공간 위임)")
+        super().__init__("joint", normalize)
+        self.alpha = float(alpha)
+        # sig 브랜치는 normalize=True 고정 (공식의 L2norm(sig_pooled) — 외부 SiglipWrapper 동형).
+        self._sig = Siglip2Anchor(projection="joint", normalize=True,
+                                  model_dir=siglip_dir or model_dir
+                                  or "google/siglip2-large-patch16-256")
+        self._dino = Dinov3Anchor(projection="pre", normalize=False,
+                                  model_dir=dino_dir
+                                  or "facebook/dinov3-vitl16-pretrain-lvd1689m",
+                                  force_size=force_size)
+        self.device = self._sig.device
+        assert self._sig.dim == self._dino.dim, \
+            f"dualfusion: SigLIP dim {self._sig.dim} != DINOv3 dim {self._dino.dim}"
+        self.dim = self._sig.dim                      # avg → SigLIP dim 유지 (1024)
+        self.dim_text = self._sig.dim_text            # 텍스트 = SigLIP2 (1024)
+        self.id = (f"dualfusion-sig{self._sig.dim}-dinov3_{self._dino.force_size}"
+                   f"-a{self.alpha}")
+
+    def _dino_pooled(self, pil_images):
+        """DINOv3 pooled CLS (외부 dual_wrapper의 dino.pooler_output 대응).
+
+        DINOv3 HF 출력에 pooler_output 있으면 사용, 없으면 CLS=last_hidden[:,0]
+        (Dinov2Anchor 주석 anchor.py:180 = HF 검증: DINO pooler == last_hidden[:,0]).
+        fp32 서브배치는 Dinov3Anchor.encode_images(anchor.py:241) 규약 미러.
+        """
+        d = self._dino
+        outs = []
+        for i in range(0, len(pil_images), 16):       # DINOv3 fp32 OOM 안전 서브배치
+            inp = d.processor(images=pil_images[i:i + 16], return_tensors="pt",
+                              size=d._size).to(d.device)
+            out = d.model(pixel_values=inp["pixel_values"].to(d.model.dtype))
+            pooled = (out.pooler_output
+                      if getattr(out, "pooler_output", None) is not None
+                      else out.last_hidden_state[:, 0])
+            outs.append(pooled.float())
+        return torch.cat(outs, 0)
+
+    @torch.no_grad()
+    def encode_images(self, pil_images):
+        import torch.nn.functional as F
+        pil_images = list(pil_images)
+        a = self._sig.encode_images(pil_images)["embeds"]       # (N,1024) L2-norm np.float32
+        a = torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
+        b = F.normalize(self._dino_pooled(pil_images), dim=-1)  # (N,1024) L2-norm
+        assert b.shape[-1] == self.dim, f"dino dim {b.shape} != {self.dim}"
+        z = F.normalize((1.0 - self.alpha) * a + self.alpha * b, dim=-1)   # unit, 1024-d
+        return {"embeds": z.float().cpu().numpy(), "tokens": None}
+
+    @torch.no_grad()
+    def encode_texts(self, texts):
+        """DINOv3는 텍스트 타워 없음 → 순수 SigLIP2 텍스트 pooler (1024-d, 미혼합)."""
+        return self._sig.encode_texts(texts)
+
+
+class DualConcatAnchor(DualFusionAnchor):
+    """Arm B — no-mix concat fusion (cowork §3-2). 로딩/텍스트/pooled 는 DualFusionAnchor 재사용.
+
+    z = concat([L2norm(sig_pooled), L2norm(dino_pooled)]) → 2048-d.
+      • concat 은 재정규화하지 않음 (각 서브블록이 이미 unit; 2048 전역 재정규화는 두 기질의
+        상대 스케일을 뭉개어 no-mix 취지를 훼손 → 미적용. avg판의 unit 스케일 교정과 목적이 다름).
+      • 텍스트 = SigLIP2 서브블록(첫 1024-d)만 → 언어정렬은 SigLIP2 블록 대상 (§3-2).
+    ⚠ dim_text(1024) != dim(2048): phase2 lang 토큰은 z-공간 토큰들과 torch.stack
+       (train_phase2.py:299)으로 균일폭 결합됨 → 폭 불일치로 concat arm 에서 stack 실패.
+       loss/토큰 코드는 여기서 수정하지 않음 — SigLIP2 서브블록 정렬 hook 필요 (report 플래그).
+    """
+    has_text = True
+    patch_dim = None
+
+    def __init__(self, projection="joint", normalize=False, model_dir=None,
+                 siglip_dir=None, dino_dir=None, force_size=256):
+        super().__init__(projection=projection, normalize=normalize,
+                         model_dir=model_dir, siglip_dir=siglip_dir,
+                         dino_dir=dino_dir, alpha=0.5, force_size=force_size)
+        self.dim = self._sig.dim + self._dino.dim     # 1024 + 1024 = 2048
+        self.dim_text = self._sig.dim_text            # SigLIP2 서브블록 = 1024
+        self.id = f"dualconcat-sig{self._sig.dim}-dinov3_{self._dino.force_size}"
+
+    @torch.no_grad()
+    def encode_images(self, pil_images):
+        import torch.nn.functional as F
+        pil_images = list(pil_images)
+        a = self._sig.encode_images(pil_images)["embeds"]       # (N,1024) unit np.float32
+        a = torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
+        b = F.normalize(self._dino_pooled(pil_images), dim=-1)  # (N,1024) unit
+        z = torch.cat([a, b], dim=-1)                 # (N,2048) — 재정규화 안 함
+        assert z.shape[-1] == self.dim, f"concat dim {z.shape} != {self.dim}"
+        return {"embeds": z.float().cpu().numpy(), "tokens": None}
+
+
 _REGISTRY = {"clip": ClipAnchor, "siglip2": Siglip2Anchor, "dinov2": Dinov2Anchor,
-             "dinov3": Dinov3Anchor, "radio": RadioAnchor}
+             "dinov3": Dinov3Anchor, "radio": RadioAnchor,
+             "dualfusion": DualFusionAnchor, "dualconcat": DualConcatAnchor}
 
 
 def get_anchor(cfg=None):
@@ -346,8 +456,9 @@ def get_anchor(cfg=None):
     if name not in _REGISTRY:
         raise KeyError(f"unknown anchor '{name}' (지원: {sorted(_REGISTRY)})")
     _pre = name in ("dinov2", "dinov3")               # 무언어 = joint 공간 없음 → pre 고정
+    _raw = name in ("dinov3", "dualconcat")           # concat = 서브블록 unit, 전역 재정규화 안 함
     kwargs = {"projection": a.get("projection", "pre" if _pre else "joint"),
-              "normalize": a.get("normalize", False if name == "dinov3" else True)}
+              "normalize": a.get("normalize", False if _raw else True)}
     if name == "clip":
         return ClipAnchor(**kwargs, cfg=cfg)
     if name == "dinov2":
@@ -356,4 +467,10 @@ def get_anchor(cfg=None):
     if name == "dinov3":                              # C2 dense: 해상도/pool은 §2.2 결정 반영
         kwargs["force_size"] = a.get("force_size", 256)
         kwargs["pool_to"] = a.get("pool_to")          # None=native grid / 16=512→16×16 fallback
+    if name in ("dualfusion", "dualconcat"):          # 관측-레벨 융합 (cowork §3-2)
+        kwargs["siglip_dir"] = a.get("siglip_dir")
+        kwargs["dino_dir"] = a.get("dino_dir")
+        kwargs["force_size"] = a.get("force_size", 256)
+        if name == "dualfusion":
+            kwargs["alpha"] = a.get("alpha", 0.5)
     return _REGISTRY[name](**kwargs, model_dir=a.get("model_dir"))
