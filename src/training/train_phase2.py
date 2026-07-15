@@ -410,6 +410,9 @@ def main():
             toks = toks + [obs_tok[:, k] for k in range(K)]
         gen = torch.Generator(device=device)
         gen.manual_seed(0)
+        _zd = toks[0].shape[-1]                        # concat 융합: lang/wrist(1024)를 z 폭(2048)에 맞춰
+        toks = [t if t.shape[-1] == _zd else           #   SigLIP2 서브블록 위치에 zero-pad (기존 런=no-op)
+                torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
         zeta = model(torch.stack(toks, dim=1), generator=gen) if is_flow \
             else model(torch.stack(toks, dim=1))
         lat_target = ae.g(val_t[4], val_t[1])

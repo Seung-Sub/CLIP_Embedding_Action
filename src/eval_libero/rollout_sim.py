@@ -173,6 +173,9 @@ def main():
                         toks = toks + obs_toks(obs)
                     # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
                     # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
+                    _zd = toks[0].shape[-1]            # concat 융합: lang/wrist(1024)→z 폭(2048) zero-pad (기존=no-op)
+                    toks = [t if t.shape[-1] == _zd else
+                            torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
                     zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
                     if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
                         zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
