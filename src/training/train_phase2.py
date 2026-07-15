@@ -290,6 +290,11 @@ def main():
     lam_consist = w.get("consist", 0.1)
 
     def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs):
+        zdim = zp.shape[-1]                           # no-mix concat 융합(dualconcat, 2048): lang=SigLIP2(1024)
+        if use_lang and lang.shape[-1] < zdim:        #   < z 폭 → SigLIP2 서브블록 위치[0:1024]에 zero-pad
+            lang = torch.nn.functional.pad(lang, (0, zdim - lang.shape[-1]))   #   (언어정렬=SigLIP2 블록만, 학습 0)
+        if use_wrist and wr.shape[-1] < zdim:         #   손목 토큰도 동일 폭 정합 (기존 pooled 런은 dim 일치 → no-op)
+            wr = torch.nn.functional.pad(wr, (0, zdim - wr.shape[-1]))
         base = [zp, zc, aemb] + ([lang] if use_lang else []) \
             + ([wr] if use_wrist else [])             # f4 flow 조건 = base 토큰 (미래 무접근)
         toks = list(base)
