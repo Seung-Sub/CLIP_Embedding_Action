@@ -70,6 +70,12 @@ def main():
      repr_kind, wrist_cam, obs_anchors, obs_fusion, f4) = load_models(cfg, device)
     ds = LiberoDataset(cfg)          # span/resample 재사용
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
+    # S1b 역할분리(cond_anchor): 조건 토큰=SigLIP2 서브블록[0:cond_dim] / g·h·ζ=융합 z 전체.
+    # fused=dualconcat 이면 _sig.dim 재사용(추가 로드 없음). 없으면 cond_dim=None → 기존 비트 동형.
+    cond_dim = None
+    if cfg.get("cond_anchor"):
+        cond_dim = (clip._sig.dim if hasattr(clip, "_sig")
+                    else get_anchor({"anchor": cfg["cond_anchor"]}).dim)
     span, H = ds.span, args.exec_horizon
 
     suite = benchmark.get_benchmark_dict()[args.suite]()
@@ -165,15 +171,20 @@ def main():
                     past = chunkrep.to_repr(past, repr_kind)
                     zp = torch.tensor(z_hist[0][None], device=device)
                     zc = torch.tensor(z_hist[-1][None], device=device)
-                    a_emb = ae.g(torch.tensor(past[None], device=device), zp)
-                    toks = [zp, zc, a_emb] + ([lang] if use_lang else []) \
-                        + ([torch.tensor(encode_wrist(obs)[None], device=device)]
-                           if wrist_cam else [])
+                    a_emb = ae.g(torch.tensor(past[None], device=device), zp)  # g=융합 z 전체
+                    _zd = zp.shape[-1]                # 융합 폭 (S1b=2048); 슬라이스 전 확정
+                    # S1b: 조건 토큰(z_prev/z_cur/wrist)만 SigLIP2 서브블록[0:cond_dim]; aemb·h 는 융합 전체
+                    zp_c, zc_c = (zp[:, :cond_dim], zc[:, :cond_dim]) if cond_dim else (zp, zc)
+                    wr_t = torch.tensor(encode_wrist(obs)[None], device=device) if wrist_cam else None
+                    if wrist_cam and cond_dim:
+                        wr_t = wr_t[:, :cond_dim]
+                    toks = [zp_c, zc_c, a_emb] + ([lang] if use_lang else []) \
+                        + ([wr_t] if wrist_cam else [])
                     if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
                         toks = toks + obs_toks(obs)
                     # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
                     # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
-                    _zd = toks[0].shape[-1]            # concat 융합: lang/wrist(1024)→z 폭(2048) zero-pad (기존=no-op)
+                    # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)
                     toks = [t if t.shape[-1] == _zd else
                             torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
                     zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))

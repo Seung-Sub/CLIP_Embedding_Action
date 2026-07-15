@@ -101,6 +101,25 @@ def main():
     val_ids, tr_ids = perm[:n_val], perm[n_val:]
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
 
+    # ---- S1b 비대칭 역할분리 융합 (cond_anchor 있을 때만; 없으면 아래 경로 전부 no-op = 비트 동형) ----
+    #  설계: 정책 flow 조건 토큰(z_prev/z_cur/lang/wrist)=SigLIP2-alone(의미·언어 경로) /
+    #        DeltaAE 경로(aemb=g, ζ 타깃=g, 디코딩 h, world-model)=융합 concat 전체(기하).
+    #  fused = dualconcat[L2norm(SigLIP2); L2norm(DINOv3)] 이므로 SigLIP2-alone(normalize=true)
+    #    == fused[:, :cond_dim] 로 bit-exact (동일 SigLIP2 모델·동일 L2정규화). → 별도 SigLIP2
+    #    캐시 재로딩 불필요: 융합 z 를 슬라이스하면 분리 스트림과 완전 동일(데이터 파이프라인 무변경).
+    #  주의: 기존 libero_emb_large256 캐시는 normalize=false 라 서브블록(norm=true)과 불일치 →
+    #        슬라이스가 cond_anchor(normalize=true) 규격에 맞는 유일한 정확 소스.
+    cond_dim = None
+    cond_cfg = cfg.get("cond_anchor")
+    if cond_cfg:
+        # dualconcat 은 이미 _sig 서브인코더를 보유 → 그 dim 재사용(추가 모델 로드 없음).
+        # 그 외 융합앵커라면 cond_anchor 를 직접 구성해 dim 조회.
+        cond_dim = (clip._sig.dim if hasattr(clip, "_sig")
+                    else get_anchor({"anchor": cond_cfg}).dim)
+        assert 0 < cond_dim < clip.dim, \
+            f"cond_dim {cond_dim} vs fused dim {clip.dim}: SigLIP2 서브블록 폭(<융합폭)이어야 함"
+        print(f"S1b 역할분리: 조건 토큰=SigLIP2[0:{cond_dim}] / g·h·ζ·wm=융합 concat[{clip.dim}]")
+
     # ---- F3 관측 융합 앵커 (module.obs 있을 때만; 없으면 기존 no-obs 경로와 완전 동일) ----
     obs_cfg = m_cfg.get("obs")
     obs_anchors, enc_dims, enc_names = None, {}, []
@@ -290,13 +309,21 @@ def main():
     lam_consist = w.get("consist", 0.1)
 
     def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs):
-        zdim = zp.shape[-1]                           # no-mix concat 융합(dualconcat, 2048): lang=SigLIP2(1024)
-        if use_lang and lang.shape[-1] < zdim:        #   < z 폭 → SigLIP2 서브블록 위치[0:1024]에 zero-pad
-            lang = torch.nn.functional.pad(lang, (0, zdim - lang.shape[-1]))   #   (언어정렬=SigLIP2 블록만, 학습 0)
-        if use_wrist and wr.shape[-1] < zdim:         #   손목 토큰도 동일 폭 정합 (기존 pooled 런은 dim 일치 → no-op)
-            wr = torch.nn.functional.pad(wr, (0, zdim - wr.shape[-1]))
-        base = [zp, zc, aemb] + ([lang] if use_lang else []) \
-            + ([wr] if use_wrist else [])             # f4 flow 조건 = base 토큰 (미래 무접근)
+        zdim = zp.shape[-1]                           # DeltaAE 경로 폭 (dualconcat 융합=2048; 기존=앵커 폭)
+        # ── S1b 역할분리: 조건 토큰 z_prev/z_cur/(wrist)는 SigLIP2 서브블록[0:cond_dim]만 사용
+        #    (의미·언어 경로). g/h/ζ/wm 은 아래에서 항상 융합 z 전체(zp/zc/zn 원본) 사용.
+        #    cond_dim=None(cond_anchor 미설정)이면 zp_c=zp … → 아래 전부 no-op(비트 동형).
+        zp_c, zc_c, wr_c = zp, zc, wr
+        if cond_dim:                                  # fused[:, :cond_dim] == SigLIP2-alone(norm=true)
+            zp_c, zc_c = zp[:, :cond_dim], zc[:, :cond_dim]
+            if use_wrist:
+                wr_c = wr[:, :cond_dim]
+
+        def _pad(t):                                  # 좁은 조건 토큰을 z 폭의 SigLIP2 블록[0:d]에 zero-pad
+            return t if t.shape[-1] == zdim else \
+                torch.nn.functional.pad(t, (0, zdim - t.shape[-1]))   # (언어정렬=SigLIP2 블록만, 학습 0)
+        base = [_pad(zp_c), _pad(zc_c), aemb] + ([_pad(lang)] if use_lang else []) \
+            + ([_pad(wr_c)] if use_wrist else [])     # f4 flow 조건 = base 토큰 (미래 무접근)
         toks = list(base)
         if obs_cfg:                                   # F3: 관측 토큰 K개를 열 끝에 추가
             obs_tok = obs_fusion({n: d for n, d in zip(enc_names, dobs)})  # (B,K,768)
@@ -402,16 +429,23 @@ def main():
     if f4_on:
         f4.eval()
     with torch.no_grad():
-        base = [val_t[0], val_t[1], val_t[3]] + ([val_t[5]] if use_lang else []) \
-            + ([val_t[6]] if use_wrist else [])
+        zp_v, zc_v = val_t[0], val_t[1]                # 융합 z 원본 (g/h 는 아래에서 val_t[1] 그대로 사용)
+        wr_v = val_t[6] if use_wrist else None
+        _zd = zp_v.shape[-1]                           # 융합 폭 (S1b=2048); 슬라이스 전에 확정
+        if cond_dim:                                   # S1b: 조건 토큰만 SigLIP2 서브블록[0:cond_dim]
+            zp_v, zc_v = zp_v[:, :cond_dim], zc_v[:, :cond_dim]
+            if use_wrist:
+                wr_v = wr_v[:, :cond_dim]
+        base = [zp_v, zc_v, val_t[3]] + ([val_t[5]] if use_lang else []) \
+            + ([wr_v] if use_wrist else [])
         toks = list(base)
         if obs_cfg:                                   # F3: 학습과 동일하게 관측 토큰 추가
             obs_tok = obs_fusion({n: d for n, d in zip(enc_names, val_t[7:])})
             toks = toks + [obs_tok[:, k] for k in range(K)]
         gen = torch.Generator(device=device)
         gen.manual_seed(0)
-        _zd = toks[0].shape[-1]                        # concat 융합: lang/wrist(1024)를 z 폭(2048)에 맞춰
-        toks = [t if t.shape[-1] == _zd else           #   SigLIP2 서브블록 위치에 zero-pad (기존 런=no-op)
+        # concat 융합/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)을 z 폭(2048)의 SigLIP2 서브블록에
+        toks = [t if t.shape[-1] == _zd else           #   zero-pad (기존 런=no-op)
                 torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
         zeta = model(torch.stack(toks, dim=1), generator=gen) if is_flow \
             else model(torch.stack(toks, dim=1))
