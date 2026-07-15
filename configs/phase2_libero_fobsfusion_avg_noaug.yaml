@@ -1,0 +1,65 @@
+# Phase 2 — F-OBS-FUSION Arm A (avg-fusion), NO-AUG clean regime (감사 판정 반영 2026-07-15).
+# ══════════════════════════════════════════════════════════════════════════
+# 재기준선 감사 결론: c2_control 회귀(85→72, −13pp)는 camera-aug(view:3/wrist:3)+module dropout
+#   정규화의 폐루프 효과(SigLIP2-large256-pooled 기질 특이적, 버그 아님; 오프라인 val 동급 0.383≈0.375,
+#   캐시·조립·예산 배제). aug는 CLIP(W3.3 +3.5pp)엔 도움이나 이 기질엔 −13pp confound.
+#   → 융합 arm은 NO-AUG 클린 밴드(=no-aug baseline 88.5)서 평가해야 공정. 이 config = 그 no-aug 판.
+# 대조군 = 기존 phase2_libero_siglip2_large256.pt (no-aug SigLIP2-pooled, 85-88 band).
+#   유일 차이 = anchor (siglip2 → dualfusion). aug/module-dropout 없음(no-aug baseline과 동일).
+# phase1_ckpt = fused z 로 DeltaAE 재적합한 phase1_libero_fobsfusion_avg.pt (선행 학습 필요).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_avg.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_avg   # dualfusion cache_key로 자동 분리
+
+anchor:                          # Arm A: 관측-레벨 avg-fusion (SigLIP2-L256 ⊕ DINOv3-vitl16)
+  name: dualfusion
+  projection: joint
+  normalize: true                # 공식 최종 L2norm → 출력 unit (avg판 스케일 교정)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m   # 원격박스 접근가능(C2가 사용); 실패 시 dinov2-large
+  alpha: 0.5                     # DINO 가중 (0.5 = 외부 E3 literal mean)
+  force_size: 256                # DINOv3 256/16 = 16×16 (SigLIP2-L256 그리드 정합)
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false                # ★pooled-only 융합: fine 채널 없음 (no-aug baseline과 동일)
+
+loss:
+  lat: 0.5                        # ζ_g CFM
+  act: 1.0                        # FLD 디코딩 (frozen h)
+  wm: 0.0
+  f_cfm: 0.0                      # f4 없음
+  consist: 0.0                    # f4 없음
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_fobsfusion_avg_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_fobsfusion_avg_noaug}
