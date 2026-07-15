@@ -1,0 +1,78 @@
+# Phase 2 — S1b ASYMMETRIC / ROLE-SEPARATED FUSION, NO-AUG clean regime (2026-07-15).
+# ══════════════════════════════════════════════════════════════════════════
+# 기반: phase2_libero_fobsfusion_concat_noaug.yaml (융합=dualconcat 2048, phase1 재사용).
+# ★ S1b 역할분리 (cond_anchor 블록으로 활성화 — 없으면 단일앵커 경로와 완전 동일):
+#   • 정책 flow 조건 토큰 = z_prev, z_cur, lang, (wrist)  →  SigLIP2-alone pooled (1024-d).
+#       태스크 추론을 의미/언어 경로로 강제 (기하 성분 배제).
+#   • DeltaAE 경로 (aemb=g, ζ 타깃=g, 디코딩 h, world-model 항, h 의 상태입력 z_t)
+#       →  융합 concat [SigLIP2 ; DINOv3] (2048-d). 기하는 변위 좌표계+디코더에만 존재.
+#   • phase1 DeltaAE(g,h)는 융합 concat z 위에서 이미 학습됨(phase1_libero_s1b_hybrid.pt)
+#       → phase1 재학습 없음 (aemb/ζ/h 는 전부 융합-Δ 잠재이므로 g 의 출력을 그대로 유지).
+# ★ 구현: fused=dualconcat[L2norm(SigLIP2); L2norm(DINOv3)] 이므로 SigLIP2-alone(normalize=true)
+#   == fused[:, :1024] 로 bit-exact. train_phase2/rollout_sim 는 융합 z 를 슬라이스해 조건 토큰을
+#   구성(별도 SigLIP2 캐시 재로딩 불필요). 조건 토큰(1024)은 z 폭(2048)의 SigLIP2 서브블록[0:1024]에
+#   zero-pad 되어 flow 입력투영(n_tokens×2048)과 정합 → 정책 모델 아키텍처 무변경, phase1 재사용 유효.
+#   (주의: 기존 libero_emb_large256 캐시는 normalize=false → 서브블록[norm=true]과 불일치하므로
+#    슬라이스가 cond_anchor:normalize:true 규격에 맞는 유일한 정확 소스.)
+# 대조 = 기존 no-aug baseline(85.0). aug/module-dropout 없음(clean 88밴드).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_s1b_hybrid.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # dualconcat cache_key로 자동 분리
+
+anchor:                          # DeltaAE 경로(g/h/ζ/wm)용 융합 앵커: no-mix concat (SigLIP2-L256 ⊕ DINOv3)
+  name: dualconcat
+  projection: joint
+  normalize: false               # ★concat 전역 재정규화 안 함 (서브블록 각각 unit = no-mix 취지)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+
+cond_anchor:                     # ★S1b: 정책 flow 조건 토큰(z_prev/z_cur/lang/wrist)용 SigLIP2-alone 앵커
+  name: siglip2                  #   융합 z 의 SigLIP2 서브블록[0:1024]과 동일 규격(동일 모델·normalize)
+  model_dir: google/siglip2-large-patch16-256
+  projection: joint
+  normalize: true                # ★서브블록과 정합 (dualconcat 내부 SigLIP2 브랜치도 normalize=true)
+
+module:
+  name: flow
+  flow_source: past              # x0 = aemb (융합 2048) — 조건 토큰 SigLIP2 슬라이스와 무관하게 융합 소스 유지
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false                # ★pooled-only 융합: fine 채널 없음 (no-aug baseline과 동일)
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_s1b_asym_hybrid_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_s1b_asym_hybrid_noaug}

@@ -67,7 +67,7 @@ class DeltaAE(nn.Module):
                  layers=4, dropout=0.0, state_cond=True,
                  decoder_state_cond=None, encoder_state_cond=None,
                  align_mode="dz", contrast_w=0.0, contrast_loss="infonce",
-                 contrast_head=False, sigmoid_bias0=-5.5):
+                 contrast_head=False, sigmoid_bias0=-5.5, align_block=None):
         """decoder_state_cond/encoder_state_cond: h/g 각각 독립적으로 상태조건을
         끄기 위한 오버라이드. None이면 state_cond와 동일(기존 동작 유지).
           decoder_state_cond=False (C0) : h가 z_t 없이도 되는지 (실측: 거의 무손실)
@@ -86,6 +86,9 @@ class DeltaAE(nn.Module):
                               layers, dropout, dec_cond)
         assert align_mode in ("dz", "direct", "hybrid"), align_mode
         self.align_mode = align_mode
+        # S1b: 융합 ζ(예: dualconcat 2048)의 SigLIP2 블록[0:align_block]만 모션문장 InfoNCE
+        #   정렬(텍스트=SigLIP2 dim). None이면 전체 ζ(기존 CLIP-768/SigLIP 단일 경로 동일).
+        self.align_block = align_block
         self.contrast_w = contrast_w
         self.contrast_loss = contrast_loss   # "infonce"(기본) | "sigmoid"(SigLIP식)
         if align_mode != "dz":
@@ -104,6 +107,8 @@ class DeltaAE(nn.Module):
         """대조 정렬 손실 (direct/hybrid 전용). contrast_loss="infonce"(SupCon 다중양성:
         동일 문장 샘플은 다중 양성으로 마스킹 — 고유 문장 수가 적어 배치 내 중복 흔함) |
         "sigmoid"(SigLIP식 쌍별 이진, 전역 t·b). contrast_proj 존재 시 g를 투영."""
+        if self.align_block is not None:         # S1b: SigLIP2 블록만 텍스트 정렬 (기하 블록 제외)
+            ghat = ghat[..., :self.align_block]  #   ζ[0:1024] ↔ SigLIP2 모션텍스트(1024) 차원 정합
         if hasattr(self, "contrast_proj"):
             ghat = self.contrast_proj(ghat)
         gn = nn.functional.normalize(ghat, dim=1)

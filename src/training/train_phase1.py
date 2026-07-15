@@ -157,7 +157,8 @@ def main():
                     contrast_w=float(w.get("contrast", 0.0)),
                     contrast_loss=m_cfg.get("contrast_loss", "infonce"),
                     contrast_head=m_cfg.get("contrast_head", False),
-                    sigmoid_bias0=m_cfg.get("sigmoid_bias0", -5.5)).to(device)
+                    sigmoid_bias0=m_cfg.get("sigmoid_bias0", -5.5),
+                    align_block=m_cfg.get("align_block")).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"DeltaAE params: {n_params/1e6:.2f}M (encoder cnn/{m_cfg['hidden']}x"
           f"{m_cfg['layers']}, decoder mlp/{m_cfg['hidden']}x{m_cfg['layers']})")
