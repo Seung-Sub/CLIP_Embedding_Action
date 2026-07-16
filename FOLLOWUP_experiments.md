@@ -128,3 +128,19 @@
 2. **SR↔언어 tradeoff의 근본성**: 조건화의 비언어 시각용량이 언어민감도를 희석한다 — 이게 frozen-VL-접지 특유인가, 일반적인가?
 3. **offline≠SR / decoder null-space**: eff-rank 5.5 병목 → 왜 정책-측 flow(actionflow)는 되고 디코더-측 flow(h-flow/M7)는 안 되나?
 4. **평가 프로토콜 표준화**: 랩간 비교를 위한 공통 프로토콜(50롤/held-out/판별하네스)?
+
+## 10. Phase-A 아키텍처 서치 (best base 탐색, 2026-07-16)
+목표: wrist 적용 전, 다양한 조합으로 best base 확정. 결과 = **복잡한 방법은 전부 음성, 단순 관측융합이 승자.**
+| 방법 | 결과 | 판정 |
+|---|---|---|
+| concat-latent-MLP (관측융합) | **97.5%** | ✅ **현 best base (SR)** |
+| avg-latent-MLP | 91.5% (언어+74) | ✅ 균형 base |
+| naive h-flow (MLP 전체대체) | 37% | ❌ mode-switching |
+| actionflow (h 우회 direct action) | 76/80% | ❌ ζ 접지 버림 |
+| **residual-h-flow (MLP평균+잔차flow, Q2/M7)** | **~48-65%** | ❌ 잔차-flow도 폐루프 무익(콜리그 M7/Q2와 정합) |
+| **grid-token (DINOv3 patch 무게이트 관측)** | OOM-사망(무결과) | ⚠ F3-echo 위험+dense 인코딩 OOM 불안정 |
+| DINOv2 vs DINOv3 (매칭전처리) | 동급 | 백본 무차별 |
+| center-crop 전처리 | +~5pp 레버 | ✅ 미적용(cheap) |
+
+→ **통합 결론**: **"어디에 넣느냐(관측 본류)"가 값이고, 디코더/코드-측 복잡화(flow-decode 계열)·타깃-측 게이트(C1/C2)·역할분리(S1b)·패치-관측(F3/grid-token)는 무익.** best base = **concat 97.5 / avg 91.5(언어균형)**. 남은 cheap 개선 = center-crop. 이 단순성 자체가 "frozen 변위 접지"의 강한 서사(복잡한 시각융합보다 삽입점·전처리가 결정).
+- **ops 노트**: dense-patch 인코딩(grid-token)·동시 롤아웃서 proc-death+zombie GPU 반복 → HF_HUB_OFFLINE 기본화 + watchdog docker restart로 대응(데이터 무손실).
