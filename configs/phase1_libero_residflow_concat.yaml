@@ -1,0 +1,60 @@
+# Phase 1 (LIBERO) — RESIDUAL-FLOW 디코더 ("h-flow done PROPERLY", 콜리그 M7/Q2 동형).
+# ══════════════════════════════════════════════════════════════════════════
+# 전면교체 h-flow(h_mode=flow, phase1_libero_s2_concat_hflow.pt)는 closed-loop 37%
+#   (재계획마다 독립 모드 샘플 → mode-switching 배회). 여기선 결정론 MLP 조건평균을
+#   **앵커로 유지**하고 flow는 잔차(a − 평균)만 소분산으로 모델링:
+#     a = mean(ζ,z_t) [ChunkDecoder, L1] + res(ζ,z_t) [ChunkFlowDecoder, 잔차 CFM]
+#   → 평균이 궤적을 고정(안정), 잔차 flow가 다봉성을 위에 얹음. res.x0_std = 잔차 std
+#     (액션 std 아님 → 소분산). 콜리그 SigLIP/src/models/networks.py ResidualFlowHead(M7)
+#     + policy.py mlp_residual_latent(Q2)의 잔차 정식화를 우리 h(디코더) 위치에 이식.
+#   기질 = 최고 성능 concat 융합(dualconcat 2048). fused z 캐시(fobsfusion_concat) 재사용.
+#   대조 = phase1_libero_fobsfusion_concat.pt(순수 MLP h) / phase1_libero_s2_concat_hflow.pt(전면 flow).
+#   실행: python src/training/train_phase1.py --config configs/phase1_libero_residflow_concat.yaml
+#   ── AVG 변형: anchor.name=dualavg(또는 avg 융합) + cache_dir=..._avg + latent_dim은
+#      train_phase1이 anchor.dim(1024)으로 자동 덮어씀. model/loss/train 블록은 그대로.
+#      (concat=2048 no-mix가 기본. avg=1024는 스케일 뭉갬 변형으로 병행 비교용.)
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # concat 캐시 재사용
+
+anchor:
+  name: dualconcat
+  projection: joint
+  normalize: false
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+
+model:
+  latent_dim: 768              # train_phase1.py가 anchor.dim(2048)으로 자동 덮어씀
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+  h_mode: residual_flow        # ★ h = MLP 조건평균(앵커) + 잔차 flow (전면교체 flow 아님)
+  h_flow_steps: 5              # 잔차 flow 추론 Euler 스텝 (cowork 권고 K≤5)
+
+loss:
+  align: 0.5                   # g: dz-align (full ζ 2048)
+  recon: 0.5                   # h 평균: L1 p(a | Δz, z_t) — 안정 백본
+  cycle: 0.25                  # h 평균: L1 p(a | g(a), z_t)
+  res_flow: 1.0                # ★ 잔차 flow CFM 항 (recon+cycle 잔차 target 합) — 평균 위 다봉성
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_residflow_concat.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_residflow_concat}

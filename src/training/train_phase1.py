@@ -348,6 +348,18 @@ def main():
     if model.h_mode == "flow":                    # S2: h-flow x0 스케일 = 액션청크 타깃 std
         model.h.x0_std.fill_(float(np.asarray(C_tr).reshape(len(C_tr), -1).std()))
         print(f"h-flow decoder: steps={model.h.steps}, x0_std={model.h.x0_std.item():.4f}")
+    elif model.h_mode == "residual_flow":         # 잔차 flow x0 스케일 = **잔차**(a − 평균) std
+        # (전면교체 flow의 액션 std가 아니라 잔차 std → 평균 주위 소분산). 초기 평균으로 추정.
+        with torch.no_grad():
+            n = min(len(C_tr), 8192)              # std 추정용 subsample (메모리 절약)
+            Cs = torch.tensor(np.asarray(C_tr)[:n], device=device)
+            Ts = torch.tensor(np.asarray(T_tr)[:n], device=device)
+            Zs = torch.tensor(np.asarray(Zt_tr)[:n], device=device)
+            resid = (Cs - model.h.mean(Ts, Zs)).reshape(n, -1)
+            model.h.res.x0_std.fill_(float(resid.std()))
+        print(f"residual-flow decoder: steps={model.h.res.steps}, "
+              f"x0_std(residual)={model.h.res.x0_std.item():.4f} "
+              f"(action_std={float(np.asarray(C_tr).reshape(len(C_tr), -1).std()):.4f})")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"DeltaAE params: {n_params/1e6:.2f}M (encoder cnn/{m_cfg['hidden']}x"
           f"{m_cfg['layers']}, decoder {model.h_mode}/{m_cfg['hidden']}x{m_cfg['layers']})")
@@ -430,9 +442,9 @@ def main():
         acyc = model.h(model.g(Cv, Zv), Zv).cpu().numpy().reshape(len(Cv), -1)
     Cva = C_va.reshape(len(C_va), -1)
     dec_r2, cyc_r2 = r2(Cva, ahat), r2(Cva, acyc)
-    if getattr(model, "h_mode", "mlp") == "flow":   # 생성 디코더: 단일샘플 R²는 낮음(분포서 모드 샘플).
+    if getattr(model, "h_mode", "mlp") in ("flow", "residual_flow"):   # 생성 디코더: 단일샘플 R²는 낮음(분포서 모드 샘플).
         with torch.no_grad():                        #   K샘플 평균-R²가 MLP급이면 수렴·조건분산(다봉), 낮으면 미수렴.
-            K = 32
+            K = 32                                   #   residual_flow는 평균이 앵커라 단일샘플 R²도 이미 높아야 정상.
             gz = model.g(Cv, Zv)
             mrec = np.mean([model.h(Dv, Zv).cpu().numpy().reshape(len(Cv), -1)
                             for _ in range(K)], axis=0)

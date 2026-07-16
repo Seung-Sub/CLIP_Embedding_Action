@@ -1,0 +1,67 @@
+# Phase 2 — RESIDUAL-FLOW 디코더 concat, NO-AUG clean regime ("h-flow done PROPERLY").
+# ══════════════════════════════════════════════════════════════════════════
+# 정책(FlowPolicy)은 phase1_libero_s2_concat_hflow_noaug와 동일 — 바뀐 것은 phase1 ckpt의
+#   디코더 h뿐(residual_flow). phase2는 동결 ae.h(ζ̂, z_cur)로 디코딩하는데, residual_flow에선
+#   이 호출이 mean(ζ̂,z_cur) + 잔차 flow 샘플을 반환(인터페이스 동일, train_phase2/rollout 무변경).
+#   → 평균 앵커가 closed-loop 안정성을 주고, 잔차 flow가 소분산 다봉성을 얹음(전면교체 37% 회피).
+# 융합 = concat[SigLIP2-pooled ; DINOv3-pooled] 2048 NO-MIX. lang은 SigLIP2 블록에 zero-pad.
+# phase1_ckpt = residual_flow로 재적합한 phase1_libero_residflow_concat.pt (선행 학습 필요).
+# 대조 = phase2_libero_s2_concat_hflow_noaug(전면 flow) / phase2_libero_fobsfusion_concat_noaug(MLP h).
+#   실행: python src/training/train_phase2.py --config configs/phase2_libero_residflow_concat_noaug.yaml
+#   롤아웃 안정화: rollout_sim.py --flow-fixed-noise (에피소드당 잔차 노이즈 고정).
+#   ── AVG 변형: phase1_ckpt를 avg phase1(dualavg)로, anchor.name=dualavg, cache_dir=..._avg.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_residflow_concat.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # dualconcat cache_key로 자동 분리
+
+anchor:                          # 관측-레벨 no-mix concat (SigLIP2-L256 ⊕ DINOv3-vitl16)
+  name: dualconcat
+  projection: joint
+  normalize: false               # concat 전역 재정규화 안 함 (서브블록 각각 unit = no-mix 취지)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false                # pooled-only 융합: fine 채널 없음 (no-aug baseline과 동일)
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_residflow_concat_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_residflow_concat_noaug}

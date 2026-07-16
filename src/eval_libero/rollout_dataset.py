@@ -93,8 +93,31 @@ def load_models(cfg, device):
         obs_fusion = obs_fusion.to(device).eval()
         K = obs_fusion.n_query                        # attn: n_query / mean: 1
 
+    # ---- F5-H L1 그리드 관측 (module.grid_obs 있을 때만; 없으면 no-grid 기존 경로와 완전 동일) ----
+    #  train_phase2.py 의 grid_obs 구성을 그대로 미러링(UNGATED, 게이트 없음).
+    grid_anchor, grid_obs, Kg = None, None, 0
+    if m.get("grid_obs") and ck2.get("grid_obs") is not None:
+        from core.anchor import get_anchor
+        from models.obs_fusion import GridObs
+        grid_cfg = m["grid_obs"]
+        genc = grid_cfg["anchor"]
+        ganc = get_anchor({"anchor": genc})
+        if genc["name"] == "siglip2":
+            ganc.save_tokens = True
+        grid_anchor = (genc["name"], ganc,
+                       grid_cfg.get("camera", genc.get("camera", "agentview_rgb")))
+        grid_obs = GridObs(patch_dim=ganc.patch_dim,
+                           out_dim=p1["model"]["latent_dim"],
+                           n_tokens=grid_cfg.get("n_tokens", 16),
+                           pool=grid_cfg.get("pool", "avg"),
+                           d_attn=grid_cfg.get("d_attn", 768),
+                           heads=grid_cfg.get("heads", 8))
+        grid_obs.load_state_dict(ck2["grid_obs"])
+        grid_obs = grid_obs.to(device).eval()
+        Kg = grid_obs.n_tokens
+
     policy = build_policy_from_cfg(
-        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K,
+        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K + Kg,
         latent_dim=p1["model"]["latent_dim"],
         action_flat_dim=ck1["n_chunk"] * ck1["action_dim"]).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
@@ -132,11 +155,11 @@ def load_models(cfg, device):
         f4.load_state_dict(fsd, strict=True)
         f4 = f4.to(device).eval()
 
-    # obs_anchors/obs_fusion/f4 는 해당 모듈일 때만 non-None; no-obs·no-f4 호출부는 *_로 무시.
-    # dual=None (단일 스트림) — dual 경로는 _load_models_dual 에서 13번째 원소로 dict 반환.
+    # obs_anchors/obs_fusion/f4/grid_obs 는 해당 모듈일 때만 non-None; 미사용 호출부는 *_로 무시.
+    # dual=None (단일 스트림). grid_anchor/grid_obs 는 14·15번째(뒤에 append → *_ 호출부 안전).
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, obs_anchors, obs_fusion, f4, None)
+            wrist_cam, obs_anchors, obs_fusion, f4, None, grid_anchor, grid_obs)
 
 
 def _load_models_dual(cfg, device, ck1):
@@ -162,10 +185,10 @@ def _load_models_dual(cfg, device, ck1):
     assert wrist_cam, "dual_stream: data.wrist_camera 필요"
     dual = {"dim_main": dim_main, "dim_wrist": dim_wrist, "dim_cat": dc,
             "anchor_wrist": ck2["config"]["anchor_wrist"]}
-    # use_lang 만 의미; use_wrist/obs/f4 는 dual 경로에서 미사용(None).
+    # use_lang 만 의미; use_wrist/obs/f4/grid 는 dual 경로에서 미사용(None).
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, None, None, None, dual)
+            wrist_cam, None, None, None, dual, None, None)
 
 
 def sample_zeta(policy, f4, tokens, generator=None):
@@ -207,7 +230,8 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4, dual) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4, dual,
+     grid_anchor, grid_obs) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     clip_wrist = get_anchor({"anchor": dual["anchor_wrist"]}) if dual else None
@@ -229,6 +253,9 @@ def main():
     # F3: 앵커별 dense patch 토큰 D[t] (Z[t]=z_cur 와 동일 인덱스 정렬)
     D_obs = ([(name, ds.dense_embeddings(anc, ep, cam))
               for name, anc, cam in obs_anchors] if obs_fusion is not None else [])
+    # F5-H L1: 그리드 관측 앵커(DINOv3) dense patch 격자 D[t] (Z[t] 와 동일 인덱스 정렬)
+    D_grid = (ds.dense_embeddings(grid_anchor[1], ep, grid_anchor[2])
+              if grid_obs is not None else None)
     lang = torch.tensor(ds.instruction_embedding(clip, ep)[None],
                         device=device) if use_lang else None
     T = len(acts)
@@ -267,6 +294,9 @@ def main():
                     obs_tok = obs_fusion({name: torch.tensor(D[t][None], device=device)
                                           for name, D in D_obs})   # (1,K,768)
                     toks = toks + [obs_tok[:, k] for k in range(obs_tok.size(1))]
+                if grid_obs is not None:              # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
+                    grid_tok = grid_obs(torch.tensor(D_grid[t][None], device=device))
+                    toks = toks + [grid_tok[:, k] for k in range(grid_tok.size(1))]
                 zeta = policy(torch.stack(toks, dim=1))
                 ahat = chunkrep.from_repr(ae.h(zeta, z_cur).cpu().numpy()[0],
                                           repr_kind) * a_std + a_mean

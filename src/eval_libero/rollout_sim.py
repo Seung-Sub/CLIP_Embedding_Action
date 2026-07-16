@@ -58,9 +58,9 @@ def main():
                          "만들어 pooled(ζ_g)만으로 롤아웃. 미지정 시 현행과 비트 동형. "
                          "SR(full C1) vs SR(--ablate-zf) 로 ζ_f 기여 확인.")
     ap.add_argument("--flow-fixed-noise", action="store_true", default=False,
-                    help="h_mode=flow 전용: 에피소드당 x0 노이즈를 고정 시드로 → 재계획(receding-"
-                         "horizon) 간 일관된 단일 모드 유지(naive fresh-noise의 mode-switching 배회 방지). "
-                         "미지정 시 현행(재계획마다 독립 샘플)과 동일.")
+                    help="h_mode=flow/residual_flow 전용: 에피소드당 x0 노이즈를 고정 시드로 → 재계획"
+                         "(receding-horizon) 간 일관된 단일 모드 유지(naive fresh-noise의 mode-switching 배회 방지). "
+                         "residual_flow는 평균 앵커가 이미 안정적이라 잔차 노이즈만 고정. 미지정 시 재계획마다 독립 샘플.")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -71,8 +71,9 @@ def main():
         cfg["train"]["checkpoint"] = args.checkpoint
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam, obs_anchors, obs_fusion, f4, dual) = load_models(cfg, device)
-    is_hflow = getattr(ae, "h_mode", "mlp") == "flow"   # h가 flow 디코더면 generator 전달 가능
+     repr_kind, wrist_cam, obs_anchors, obs_fusion, f4, dual,
+     grid_anchor, grid_obs) = load_models(cfg, device)
+    is_hflow = getattr(ae, "h_mode", "mlp") in ("flow", "residual_flow")   # flow/residual_flow h면 generator 전달 가능
     af = getattr(policy, "flow_space", "latent") == "action"   # ★SWAP: 정책 출력이 곧 액션 → ae.h BYPASS
     if af:
         print("[ACTION-FLOW] policy.flow_space=action — ζ̂=액션청크 직접 사용(ae.h 디코딩 bypass), "
@@ -165,6 +166,19 @@ def main():
             ot = obs_fusion(feat)                            # (1,K,768)
             return [ot[:, k] for k in range(ot.size(1))]
 
+        def grid_toks(obs):
+            """F5-H L1: 현재 프레임 DINOv3 patch 격자 → grid_obs → Kg개 UNGATED 토큰.
+            zc 와 동일 프레임(앵커 카메라). 게이트 없음 — 학습과 동일 상시 삽입."""
+            _name, anc, cam = grid_anchor
+            if wrist_cam and cam == wrist_cam:
+                im = obs["robot0_eye_in_hand_image"]
+                im = im[::-1].copy() if args.flip else im
+            else:
+                im = frame(obs)
+            tok = anc.encode_images([Image.fromarray(im)])["tokens"]  # (1,P,d)
+            gt = grid_obs(torch.tensor(tok, device=device))           # (1,Kg,latent)
+            return [gt[:, k] for k in range(gt.size(1))]
+
         for ep in range(args.episodes):
             ep_gen = None                            # h-flow: 에피소드당 고정 노이즈(옵션)
             if args.flow_fixed_noise and is_hflow:
@@ -218,6 +232,8 @@ def main():
                             + ([wr_t] if wrist_cam else [])
                         if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
                             toks = toks + obs_toks(obs)
+                        if grid_obs is not None:         # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
+                            toks = toks + grid_toks(obs)
                         # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
                         # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
                         # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)

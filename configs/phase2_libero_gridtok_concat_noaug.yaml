@@ -1,0 +1,74 @@
+# Phase 2 — F5-H L1 GRID-TOKEN (UNGATED DINOv3 patch obs tokens) on CONCAT fusion base, NO-AUG.
+# ══════════════════════════════════════════════════════════════════════════
+# 방법: DINOv3 16×16 patch 격자 → 저해상 2×2(=4×4=16토큰) avg-pool(위치 보존) → 정책 잠재폭 사영 →
+#   phase2 flow 조건 토큰열 [z_prev, z_cur, g(A_past), lang, wrist, +grid×16] 에 **UNGATED 상시 삽입**
+#   (no tanh gate, step0부터 — C1/C2 게이트-굶음 회피). cowork COWORK_DESIGN_F5H_final_fusion §1 L1.
+# BASE = phase2_libero_fobsfusion_concat_noaug.yaml (우리 best base, no-mix concat 2048d) 를 그대로 상속.
+#   유일 추가 = module.grid_obs (DINOv3 dense 앵커 + GridObs 모듈). 나머지(anchor/phase1_ckpt/loss/train) 동일.
+# grid_obs 없으면 이 파일 = concat_noaug 와 비트 동형(가드). 폐루프=관측/조건 경로 삽입(F3와 달리 위치보존 저해상).
+# ⚠ 정직한 리스크: F3의 obs 토큰도 이미 ungated append였고 richer-obs로 폐루프 악화 → 이 팔은 F3의 그림자.
+#   유일 구조차 = 위치보존 저해상 격자(2×2) + 단일 DINOv3. cowork 설계는 P6/델타 게이트 + aug 레짐 권고
+#   (본 config 는 사용자 지시대로 no-aug clean; aug 미적용은 지름길 억제 장치 없음 = 리스크 상향).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_concat.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # dualconcat cache_key로 자동 분리
+
+anchor:                          # 본류 관측 = no-mix concat (SigLIP2-L256 ⊕ DINOv3-vitl16) 2048d
+  name: dualconcat
+  projection: joint
+  normalize: false
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  grid_obs:                      # ★F5-H L1: UNGATED DINOv3 patch 격자 관측 토큰 (게이트 없음)
+    anchor:                      #   grid 전용 DINOv3 dense 앵커 (patch 토큰 노출; dense 캐시 cache_key로 분리)
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      force_size: 256            #   256/16 = 16×16 = 256 patch (SigLIP2-L256 그리드 정합)
+    pool: avg                    #   2×2 avg-pool (파라미터-0 공간 다운샘플, 위치 보존) — attn 는 학습형 ablation
+    n_tokens: 16                 #   16×16 → 4×4 = 16 그리드 토큰 (MolmoAct 선례)
+    camera: agentview_rgb        #   z_cur 와 동일 프레임(현재 관측)
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_gridtok_concat_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_gridtok_concat_noaug}

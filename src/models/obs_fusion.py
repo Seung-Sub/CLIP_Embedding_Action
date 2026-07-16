@@ -78,3 +78,61 @@ class ObsFusion(nn.Module):
         q = self.query.unsqueeze(0).expand(kv.size(0), -1, -1)   # (B, n_query, d_attn)
         o, _ = self.attn(q, kv, kv)                      # cross-attn 풀링
         return self.out(self.ln(o))                      # (B, n_query, out_dim)
+
+
+class GridObs(nn.Module):
+    """F5-H L1 — UNGATED 그리드 관측 토큰 (cowork COWORK_DESIGN_F5H §1 L1, 선택 팔).
+
+    DINOv3(등) dense patch 격자 (B, P=g×g, patch_dim) → **가벼운 공간 풀링**으로
+    K=g_out×g_out 토큰(위치 보존, MolmoAct 선례) → 각 토큰을 정책 잠재폭(out_dim)으로
+    사영 → phase2 flow 조건 토큰열 끝에 **UNGATED 상시 삽입**(no tanh gate, step0부터).
+
+    ObsFusion(F3)과의 차이 — 왜 별도 모듈인가:
+      • ObsFusion의 pool 은 'attn'(K개 학습쿼리 cross-attn = F3가 실패한 학습형 요약) 또는
+        'mean'(전 patch 평균 → 1토큰, 공간 전멸)뿐 — **공간 격자를 보존하는 저해상 풀이 없음**.
+      • GridObs는 patch 격자를 g_out×g_out 로 **avg-pool(파라미터-0)** 하여 위치/기하를 유지
+        (S1b: 기하는 관측/조건 경로에서 도움). 학습 부품은 사영 1개(A1 "학습 최소화").
+      • 단일 앵커(DINOv3) 전용 — 다중 인코더 융합(ObsFusion)과 목적/구조가 다름.
+    ★ C1/C2(f4.py)와의 차이: C1/C2는 텍스트-쿼리 cross-attn dense patch → tanh(α/β) 게이트
+      **타깃/액션코드 측** fine 잔차(게이트 미개방=굶음). GridObs는 게이트 없이 **관측/조건 측**
+      에 상시 삽입 → cold-start 없음. (단 정직한 리스크: F3의 obs 토큰도 이미 ungated append였고
+      폐루프가 richer-obs로 악화했음 — 아래 pool='avg'의 위치보존·저해상이 유일한 구조적 차이.)
+
+    pool:
+      'avg' / '2x2' : adaptive_avg_pool2d(g×g → g_out×g_out) — 파라미터-0 공간 다운샘플.
+                      출력 격자는 n_tokens 로 결정(g_out=round(√n_tokens); 기본 16 → 4×4).
+      'attn'        : K개 학습쿼리 × cross-attn(학습형 풀; ObsFusion.attn 단일앵커판 — ablation용).
+    """
+    def __init__(self, patch_dim, out_dim, n_tokens=16, pool="avg",
+                 d_attn=768, heads=8):
+        super().__init__()
+        assert pool in ("avg", "2x2", "attn"), pool
+        self.pool = "avg" if pool in ("avg", "2x2") else "attn"
+        self.n_tokens = int(n_tokens)
+        self.g_out = int(round(self.n_tokens ** 0.5))
+        assert self.g_out * self.g_out == self.n_tokens, \
+            f"n_tokens={n_tokens} 는 공간 격자용 완전제곱이어야 함 (예 16→4×4)"
+        self.out_dim = out_dim
+        if self.pool == "avg":
+            self.proj = nn.Linear(patch_dim, out_dim)          # 학습 파라미터 = 사영 1개
+        else:
+            self.kv_proj = nn.Linear(patch_dim, d_attn)
+            self.ln = nn.LayerNorm(d_attn)
+            self.query = nn.Parameter(torch.randn(n_tokens, d_attn))
+            self.attn = nn.MultiheadAttention(d_attn, heads, batch_first=True)
+            self.proj = nn.Linear(d_attn, out_dim)
+
+    def forward(self, patches):                            # (B, P=g×g, patch_dim)
+        import torch.nn.functional as F
+        B, P, D = patches.shape
+        if self.pool == "avg":
+            g = int(round(P ** 0.5))
+            assert g * g == P, f"patch 격자 P={P} 가 정사각 아님 (avg-pool 불가)"
+            x = patches.reshape(B, g, g, D).permute(0, 3, 1, 2)          # (B,D,g,g)
+            x = F.adaptive_avg_pool2d(x, (self.g_out, self.g_out))       # (B,D,go,go)
+            x = x.permute(0, 2, 3, 1).reshape(B, self.n_tokens, D)       # (B,K,D)
+            return self.proj(x)                                          # (B,K,out_dim)
+        q = self.query.unsqueeze(0).expand(B, -1, -1)                    # (B,K,d_attn)
+        kv = self.ln(self.kv_proj(patches))
+        o, _ = self.attn(q, kv, kv)
+        return self.proj(o)                                              # (B,K,out_dim)

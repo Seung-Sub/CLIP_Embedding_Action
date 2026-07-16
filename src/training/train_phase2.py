@@ -399,6 +399,23 @@ def main():
             enc_dims[enc["name"]] = anc.patch_dim     # dinov2=1024 / siglip2=1152
             enc_names.append(enc["name"])
 
+    # ---- F5-H L1 그리드 관측 토큰 (module.grid_obs 있을 때만; 없으면 아래 경로 전부 no-op = 비트 동형) ----
+    #  UNGATED: DINOv3 patch 격자 → 저해상 공간 풀 → 정책 flow 조건 토큰 K개 상시 삽입(게이트 없음).
+    #  데이터는 F3 obs dense 캐시 배관(build_policy_samples obs_anchors) 그대로 재사용 — libero.py 무변경.
+    grid_cfg = m_cfg.get("grid_obs")
+    grid_anchor = None
+    if grid_cfg:
+        assert m_cfg.get("name") == "flow", "grid_obs: flow 정책 전제(조건 토큰 삽입)"
+        assert not m_cfg.get("obs"), "grid_obs 와 module.obs 는 동시 사용 불가"
+        assert not (m_cfg.get("f4") and m_cfg["f4"].get("enable")), \
+            "grid_obs 와 module.f4 는 동시 사용 불가"
+        genc = grid_cfg["anchor"]
+        ganc = get_anchor({"anchor": genc})
+        if genc["name"] == "siglip2":
+            ganc.save_tokens = True                   # siglip2: 패치 토큰 반환 활성화
+        grid_anchor = (genc["name"], ganc,
+                       grid_cfg.get("camera", genc.get("camera", "agentview_rgb")))
+
     # ---- C1/F4 fine 채널 (module.f4.enable 있을 때만; 없으면 아래 경로 전부 no-op = 비트 동형) ----
     f4_cfg = m_cfg.get("f4")
     f4_on = bool(f4_cfg and f4_cfg.get("enable"))
@@ -413,8 +430,12 @@ def main():
         f4_anchor = (f4_dense_anc, de.get("camera", "agentview_rgb"))
 
     print("삼중쌍 구성 중 (임베딩 캐시 재사용)...")
+    # grid_obs: 단일 DINOv3 앵커 dense 를 obs dense 배관으로 실체화(맨 앞 dense 배열).
+    data_obs_anchors = obs_anchors
+    if grid_cfg:
+        data_obs_anchors = [grid_anchor]
     eps = ds.build_policy_samples(clip, files, stride=cfg["data"].get("stride", 2),
-                                  obs_anchors=obs_anchors, f4_anchor=f4_anchor)
+                                  obs_anchors=data_obs_anchors, f4_anchor=f4_anchor)
 
     def stack(ids):
         return tuple(np.concatenate([eps[i][k] for i in ids])
@@ -431,9 +452,10 @@ def main():
     n_wrist = 1 if ds.wrist_camera else 0
     W_tr = Wx_tr[0] if use_wrist else None
     W_va = Wx_va[0] if use_wrist else None
-    # 인코더별 dense [N,P,d]. obs=F3 관측 인코더들 / f4=단일 patch ΔF (맨 뒤 1개).
-    Dobs_tr = Wx_tr[n_wrist:] if (obs_cfg or f4_on) else []
-    Dobs_va = Wx_va[n_wrist:] if (obs_cfg or f4_on) else []
+    # 인코더별 dense [N,P,d]. obs=F3 관측 인코더들 / f4=단일 patch ΔF (맨 뒤 1개) /
+    # grid_obs=단일 DINOv3 patch 격자 (맨 앞 1개).
+    Dobs_tr = Wx_tr[n_wrist:] if (obs_cfg or f4_on or grid_cfg) else []
+    Dobs_va = Wx_va[n_wrist:] if (obs_cfg or f4_on or grid_cfg) else []
 
     # ---- Exp2 both-aug: variant 뱅크 처리 (data.augment on일 때만) ----
     # build_policy_samples가 (N, M, D) 뱅크를 주면: val/eval은 항상 variant0(클린),
@@ -498,8 +520,24 @@ def main():
                                unshuffle=obs_cfg.get("unshuffle", 1)).to(device)
         K = obs_fusion.n_query                        # attn: n_query / mean: 1
 
+    # ---- F5-H L1 그리드 관측 모듈 (grid_obs일 때만; Kg개 UNGATED 토큰을 정책 입력열 끝에 추가) ----
+    grid_obs, Kg = None, 0
+    if grid_cfg:
+        from models.obs_fusion import GridObs
+        gp_dim = Dobs_tr[0].shape[-1]                 # DINOv3 patch 폭 (1024)
+        grid_obs = GridObs(patch_dim=gp_dim, out_dim=p1["model"]["latent_dim"],
+                           n_tokens=grid_cfg.get("n_tokens", 16),
+                           pool=grid_cfg.get("pool", "avg"),
+                           d_attn=grid_cfg.get("d_attn", 768),
+                           heads=grid_cfg.get("heads", 8)).to(device)
+        Kg = grid_obs.n_tokens
+        print(f"grid_obs: pool={grid_obs.pool}, K={Kg} tokens ({grid_obs.g_out}×"
+              f"{grid_obs.g_out} grid), patch {Dobs_tr[0].shape[-2]}×{gp_dim}→"
+              f"latent {p1['model']['latent_dim']}, UNGATED, "
+              f"params {sum(p.numel() for p in grid_obs.parameters())/1e6:.3f}M")
+
     # ---- 정책 모델 ----
-    n_tokens = 3 + int(use_lang) + int(use_wrist) + K
+    n_tokens = 3 + int(use_lang) + int(use_wrist) + K + Kg
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
                                   latent_dim=p1["model"]["latent_dim"],
                                   action_flat_dim=n_chunk * act_dim).to(device)
@@ -544,6 +582,7 @@ def main():
     opt = torch.optim.Adam(
         list(model.parameters())
         + (list(obs_fusion.parameters()) if obs_cfg else [])
+        + (list(grid_obs.parameters()) if grid_cfg else [])
         + (list(f4.parameters()) if f4_on else []),
         lr=t_cfg["lr"],
         betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
@@ -603,7 +642,10 @@ def main():
         if obs_cfg:                                   # F3: 관측 토큰 K개를 열 끝에 추가
             obs_tok = obs_fusion({n: d for n, d in zip(enc_names, dobs)})  # (B,K,768)
             toks = toks + [obs_tok[:, k] for k in range(K)]
-        toks = torch.stack(toks, dim=1)               # (B, 3~5+K, 768)
+        if grid_cfg:                                  # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
+            grid_tok = grid_obs(dobs[0])              # (B, Kg, latent_dim) — 게이트 없음
+            toks = toks + [grid_tok[:, k] for k in range(Kg)]
+        toks = torch.stack(toks, dim=1)               # (B, 3~5+K+Kg, 768)
         if is_flow:
             # lat 자리 = CFM 손실, act = FLD(ODE 샘플 디코딩). val은 고정시드로 결정화
             gen = None
@@ -666,6 +708,8 @@ def main():
         model.train()
         if obs_cfg:
             obs_fusion.train()
+        if grid_cfg:
+            grid_obs.train()
         if f4_on:
             f4.train()
         logs, parts_log = [], []
@@ -679,6 +723,8 @@ def main():
         model.eval()
         if obs_cfg:
             obs_fusion.eval()
+        if grid_cfg:
+            grid_obs.eval()
         if f4_on:
             f4.eval()
         with torch.no_grad():
@@ -713,6 +759,8 @@ def main():
     model.eval()
     if obs_cfg:
         obs_fusion.eval()
+    if grid_cfg:
+        grid_obs.eval()
     if f4_on:
         f4.eval()
     with torch.no_grad():
@@ -729,6 +777,9 @@ def main():
         if obs_cfg:                                   # F3: 학습과 동일하게 관측 토큰 추가
             obs_tok = obs_fusion({n: d for n, d in zip(enc_names, val_t[7:])})
             toks = toks + [obs_tok[:, k] for k in range(K)]
+        if grid_cfg:                                  # F5-H L1: 학습과 동일하게 UNGATED 그리드 토큰 추가
+            grid_tok = grid_obs(val_t[7])             # 단일 DINOv3 dense (val_t[7])
+            toks = toks + [grid_tok[:, k] for k in range(Kg)]
         gen = torch.Generator(device=device)
         gen.manual_seed(0)
         # concat 융합/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)을 z 폭(2048)의 SigLIP2 서브블록에
@@ -786,6 +837,7 @@ def main():
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": best_state, "config": cfg, "metrics": metrics,
                 "obs_fusion": obs_fusion.state_dict() if obs_cfg else None,
+                "grid_obs": grid_obs.state_dict() if grid_cfg else None,
                 "f4": best_f4 if f4_on else None},
                ckpt_path)
     print(f"저장: {ckpt_path}")

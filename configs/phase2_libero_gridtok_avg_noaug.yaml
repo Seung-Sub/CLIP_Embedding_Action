@@ -1,0 +1,70 @@
+# Phase 2 — F5-H L1 GRID-TOKEN (UNGATED DINOv3 patch obs tokens) on AVG fusion base, NO-AUG.
+# ══════════════════════════════════════════════════════════════════════════
+# concat 판(phase2_libero_gridtok_concat_noaug.yaml)의 avg-fusion 자매. 유일 차이 = 본류 anchor
+#   (dualconcat 2048d → dualfusion avg 1024d) + phase1_ckpt + cache_dir + checkpoint/run_name.
+# 방법/grid_obs 블록/리스크는 concat 판 헤더 주석 참조 — DINOv3 patch 격자 → 2×2 avg → 16 UNGATED 토큰.
+# grid_obs 없으면 이 파일 = fobsfusion_avg_noaug 와 비트 동형(가드).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_avg.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_avg   # dualfusion cache_key로 자동 분리
+
+anchor:                          # 본류 관측 = avg-fusion (SigLIP2-L256 ⊕ DINOv3-vitl16) 1024d
+  name: dualfusion
+  projection: joint
+  normalize: true
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  alpha: 0.5
+  force_size: 256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  grid_obs:                      # ★F5-H L1: UNGATED DINOv3 patch 격자 관측 토큰 (게이트 없음)
+    anchor:                      #   grid 전용 DINOv3 dense 앵커 (patch 토큰 노출; dense 캐시 cache_key로 분리)
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      force_size: 256            #   256/16 = 16×16 = 256 patch
+    pool: avg                    #   2×2 avg-pool (파라미터-0, 위치 보존)
+    n_tokens: 16                 #   16×16 → 4×4 = 16 그리드 토큰
+    camera: agentview_rgb        #   z_cur 와 동일 프레임(현재 관측)
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_gridtok_avg_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_gridtok_avg_noaug}

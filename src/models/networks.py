@@ -118,6 +118,37 @@ class ChunkFlowDecoder(nn.Module):
         return nn.functional.mse_loss(self._vel(xt, ctx, t), target - x0)
 
 
+class ResidualFlowDecoder(nn.Module):
+    """h_mode="residual_flow" — MLP 조건평균(결정론 백본) + 잔차 flow (콜리그 M7/Q2 동형).
+
+    ┌ 왜 전면교체 h-flow(37%)와 다른가 ────────────────────────────────────────┐
+    │ 기존 h_mode="flow"는 결정론 MLP를 flow로 **완전 교체** → 재계획(receding-  │
+    │ horizon)마다 조건분포에서 독립 모드를 샘플 → 매 계획이 다른 모드로 튀는     │
+    │ mode-switching 배회(closed-loop 37%). 여기선 MLP 조건평균이 **결정론 앵커** │
+    │ 로 남아 궤적을 고정하고, flow는 평균 주위의 **소분산 잔차**만 모델링한다.   │
+    │ 잔차는 작으므로 재계획 간 평균이 지배 → 일관·안정 + 다봉성은 잔차로 유지.   │
+    └─────────────────────────────────────────────────────────────────────────┘
+      a = mean(ζ,z_t) + res(ζ,z_t)
+        mean = ChunkDecoder      (결정론, recon/cycle L1로 학습 — 기존 mlp와 동일)
+        res  = ChunkFlowDecoder  (잔차 (a − mean.detach())만 CFM으로 수송)
+      res.x0_std = **잔차** std(액션 std 아님, train_phase1이 주입) → 평균 주위 소분산.
+    forward(z,z_t[,generator])는 ChunkDecoder/ChunkFlowDecoder와 동일 인터페이스
+    (샘플 반환)라 phase2/rollout의 ae.h(ζ,z_cur)[,generator] 무변경 호환.
+    generator는 잔차 flow x0 노이즈 재현(rollout --flow-fixed-noise 안정화)용."""
+
+    def __init__(self, action_dim, n_chunk, latent_dim=768, hidden=512,
+                 layers=4, dropout=0.0, state_cond=True, steps=5):
+        super().__init__()
+        self.n_chunk, self.action_dim = n_chunk, action_dim
+        self.mean = ChunkDecoder(action_dim, n_chunk, latent_dim, hidden,
+                                 layers, dropout, state_cond)
+        self.res = ChunkFlowDecoder(action_dim, n_chunk, latent_dim, hidden,
+                                    layers, dropout, state_cond, steps=steps)
+
+    def forward(self, z, z_t=None, generator=None):      # 샘플 = 평균 + 잔차 (ChunkDecoder 호환)
+        return self.mean(z, z_t) + self.res(z, z_t, generator=generator)
+
+
 class DeltaAE(nn.Module):
     def __init__(self, action_dim, n_chunk, latent_dim=768, hidden=512,
                  layers=4, dropout=0.0, state_cond=True,
@@ -139,12 +170,18 @@ class DeltaAE(nn.Module):
         dec_cond = state_cond if decoder_state_cond is None else decoder_state_cond
         self.g = ChunkEncoder(action_dim, latent_dim, hidden, layers,
                               dropout, enc_cond)
-        # h_mode: mlp(기본, 결정론 조건평균) | flow(S2, 조건부 flow-matching 디코더 — 미세 다봉성).
-        assert h_mode in ("mlp", "flow"), h_mode
+        # h_mode: mlp(기본, 결정론 조건평균) | flow(S2, 조건부 flow-matching 디코더 — 미세 다봉성)
+        #   | residual_flow(콜리그 M7/Q2 동형: MLP 조건평균 + 잔차 flow — 평균이 결정론 앵커,
+        #     잔차 flow가 소분산 다봉성을 얹음 → 전면교체 flow의 mode-switching 배회 회피).
+        # mlp/flow 분기는 아래 생성 인자·순서가 종전과 동일 → state_dict 비트 동형(regression-0).
+        assert h_mode in ("mlp", "flow", "residual_flow"), h_mode
         self.h_mode = h_mode
         if h_mode == "flow":
             self.h = ChunkFlowDecoder(action_dim, n_chunk, latent_dim, hidden,
                                       layers, dropout, dec_cond, steps=h_flow_steps)
+        elif h_mode == "residual_flow":
+            self.h = ResidualFlowDecoder(action_dim, n_chunk, latent_dim, hidden,
+                                         layers, dropout, dec_cond, steps=h_flow_steps)
         else:
             self.h = ChunkDecoder(action_dim, n_chunk, latent_dim, hidden,
                                   layers, dropout, dec_cond)
@@ -204,9 +241,18 @@ class DeltaAE(nn.Module):
             cos = nn.functional.cosine_similarity(ghat, delta_z, dim=1)
             l_align = (nn.functional.mse_loss(ghat, delta_z)
                        + 0.5 * (1 - cos).mean())
+        l_res = None                             # residual_flow 전용 잔차 CFM 항 (그 외 None → total 불변)
         if self.h_mode == "flow":                # S2: recon/cycle = 조건부 CFM (L1 대체)
             l_recon = self.h.cfm_loss(chunk, delta_z, z_t)   # p(a | Δz, z_t)
             l_cycle = self.h.cfm_loss(chunk, ghat, z_t)      # p(a | g(a), z_t), grad→g
+        elif self.h_mode == "residual_flow":     # M7/Q2 동형: MLP 조건평균(L1) + 잔차 flow(CFM)
+            ahat = self.h.mean(delta_z, z_t)     # 결정론 조건평균 = 안정 앵커(전면교체 flow 배회 회피)
+            acyc = self.h.mean(ghat, z_t)        # 왕복 (grad→g; 잔차 flow는 g로 grad 안 보냄)
+            l_recon = nn.functional.l1_loss(ahat, chunk)     # 평균은 기존 mlp와 동일한 L1
+            l_cycle = nn.functional.l1_loss(acyc, chunk)
+            # 잔차 target = a − mean.detach(); cond(잠재)도 detach → g/평균 목표 불변, res만 학습.
+            l_res = (self.h.res.cfm_loss(chunk - ahat.detach(), delta_z, z_t)
+                     + self.h.res.cfm_loss(chunk - acyc.detach(), ghat.detach(), z_t))
         else:
             ahat = self.h(delta_z, z_t)          # 실제 Δz(+상태) → 액션 (FLD 대응)
             acyc = self.h(ghat, z_t)             # 왕복 (phase2 디코딩 경로)
@@ -226,6 +272,9 @@ class DeltaAE(nn.Module):
             cw = self.contrast_w if self.align_mode == "hybrid" else w["align"]
             total = total + cw * l_con
             parts["contrast"] = l_con.item()
+        if l_res is not None:                    # residual_flow: 잔차 CFM 항 (w["res_flow"] 기본 1.0)
+            total = total + w.get("res_flow", 1.0) * l_res
+            parts["res_flow"] = l_res.item()
         return total, parts
 
 
