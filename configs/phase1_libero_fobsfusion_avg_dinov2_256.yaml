@@ -1,0 +1,55 @@
+# Phase 1 (LIBERO) — F-OBS-FUSION Arm A DeltaAE REFIT: fused pooled z, DINOv2 판 (dualfusion, 1024-d).
+# ══════════════════════════════════════════════════════════════════════════
+# ISOLATION 실험: "우리 DINOv3-avg 91.5% vs 콜리그 DINOv2-avg 93-96%" 격차의 원인이
+#   backbone(DINOv2 vs DINOv3)인지 eval protocol인지 분리. 이 arm = dino_dir 만 DINOv2 로 스왑
+#   (dualfusion 이 dino_dir 의 "dinov2" 로 _Dinov2FusionBranch 자동 선택; 나머지 공식 동일).
+#   fused z = L2norm(0.5*L2norm(SigLIP2-L256)+0.5*L2norm(DINOv2-large pooler_output)) 로 DeltaAE 재학습.
+# ★전처리 결정(문서화): force_size 미설정(null) → DINOv2 **기본 AutoImageProcessor**(256 resize→
+#   224 center-crop) = 콜리그 SigLIP/src/core/dual_wrapper.py EXACT (1차 arm). backbone 을 순수 통제.
+#   → 2차 arm(@256 matched-grid)이 필요하면 아래 force_size 를 null→256 한 줄만 바꾸면 됨.
+# latent_dim 은 anchor.dim(1024)으로 train_phase1.py 가 자동 설정. cache_key(id)가 dinov3 판과
+#   다르므로(dualfusion-sig1024-dinov2_def/...) 캐시 충돌 없음 + cache_dir 도 별도 경로.
+#   실행:  python src/training/train_phase1.py --config configs/phase1_libero_fobsfusion_avg_dinov2.yaml
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_avg_dinov2_256   # DINOv3 판과 별도 경로 (충돌 방지)
+
+anchor:
+  name: dualfusion
+  projection: joint
+  normalize: true                # 공식 최종 L2norm → 출력 unit
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov2-large   # "dinov2" 포함 → _Dinov2FusionBranch 선택 (콜리그 레시피)
+  alpha: 0.5
+  force_size: 256               # ★null = 콜리그 EXACT 기본 전처리(256→224 crop). 256 으로 바꾸면 2차 arm(@256 no-crop)
+
+model:
+  latent_dim: 768              # train_phase1.py 가 anchor.dim(1024)으로 자동 덮어씀
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_avg_dinov2_256.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_fobsfusion_avg_dinov2_256}
