@@ -57,6 +57,10 @@ def main():
                     help="병목-효능 프로브(C1 게이트): f4 로드 시 fine 채널 ζ_f 기여를 0으로 "
                          "만들어 pooled(ζ_g)만으로 롤아웃. 미지정 시 현행과 비트 동형. "
                          "SR(full C1) vs SR(--ablate-zf) 로 ζ_f 기여 확인.")
+    ap.add_argument("--flow-fixed-noise", action="store_true", default=False,
+                    help="h_mode=flow 전용: 에피소드당 x0 노이즈를 고정 시드로 → 재계획(receding-"
+                         "horizon) 간 일관된 단일 모드 유지(naive fresh-noise의 mode-switching 배회 방지). "
+                         "미지정 시 현행(재계획마다 독립 샘플)과 동일.")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -68,6 +72,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion, f4) = load_models(cfg, device)
+    is_hflow = getattr(ae, "h_mode", "mlp") == "flow"   # h가 flow 디코더면 generator 전달 가능
     ds = LiberoDataset(cfg)          # span/resample 재사용
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     # S1b 역할분리(cond_anchor): 조건 토큰=SigLIP2 서브블록[0:cond_dim] / g·h·ζ=융합 z 전체.
@@ -154,6 +159,10 @@ def main():
             return [ot[:, k] for k in range(ot.size(1))]
 
         for ep in range(args.episodes):
+            ep_gen = None                            # h-flow: 에피소드당 고정 노이즈(옵션)
+            if args.flow_fixed_noise and is_hflow:
+                ep_gen = torch.Generator(device=device)
+                ep_gen.manual_seed(10000 * tid + ep)
             env.reset()
             obs = env.set_init_state(init_states[ep % len(init_states)])
             for _ in range(5):                       # 물리 안정화 (LIBERO 관례)
@@ -190,7 +199,8 @@ def main():
                     zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
                     if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
                         zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
-                    ahat_lat = ae.h(zeta, zc)             # frozen h(ζ_g, z_cur) = pooled 채널
+                    ahat_lat = ae.h(zeta, zc, generator=ep_gen) if is_hflow \
+                        else ae.h(zeta, zc)              # frozen h(ζ_g, z_cur); flow면 에피소드 고정노이즈
                     if f4 is not None:                   # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
                         ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
                     ahat = chunkrep.from_repr(
