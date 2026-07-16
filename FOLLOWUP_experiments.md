@@ -157,7 +157,8 @@
 | closed-loop SR (correct, 부분×3) | **66.7% / 76.2% / 80.6%** | ❌ large256-single baseline **85-88 하회 = uplift 없음** |
 
 → **판정**: **wrist-추론(dual-stream 변위)은 closed-loop 이득 없음.** offline은 건강하나(변위가 잘 학습·정렬됨) 폐루프 성공률은 baseline 이하 → wrist를 추론 스트림으로 승격해도 정책이 이득 못 얻음. **Phase-A의 "복잡화 무익, 단순 관측융합 승자" 패턴과 완전 정합** (h-flow/actionflow/residual-flow/grid-token에 이어 dual-stream도 음성). wrist는 현행 **조건입력**이 최선.
-- **⚠ 한계(정직)**: 롤아웃이 이 박스에서 **CAP4/2/1 모두 27-84ep서 proc-death**(osmesa/mujoco per-process 렌더링 누수 추정) → full-400 완주 불가, 3회 부분판독. 매칭 large256-single phase2 ckpt 부재로 동일-task 동시대조는 미수행. 단 3회 부분 모두 66-81%로 baseline을 넘지 못해 **"이득 없음" 결론은 방향상 견고**(uplift였다면 88+ 방향이어야). 정밀 수치는 롤아웃 안정화 후 재검 가능.
+- **⚠ 한계(정직)**: 롤아웃이 이 박스에서 **CAP4/2/1 모두 27-84ep서 proc-death** → full-400 완주 불가, 3회 부분판독. 매칭 large256-single phase2 ckpt 부재로 동일-task 동시대조는 미수행. 단 3회 부분 모두 66-81%로 baseline을 넘지 못해 **"이득 없음" 결론은 방향상 견고**(uplift였다면 88+ 방향이어야). 정밀 수치는 롤아웃 안정화 후 재검 가능.
+- **🔧 불안정 근본원인 진단(2026-07-16)**: 침묵사(Python traceback 없음, ep 7/28/67/84 = 확률적) = **osmesa 소프트웨어-렌더 세그폴트**가 유력. **RAM-OOM 아님**(503GB 중 148GB 여유). **EGL 전환 시도→실패**(`EGLGLContext._context` 없음 = 컨테이너 EGL 디스플레이 부재, import은 되나 렌더 컨텍스트 생성 불가). → 남은 워크어라운드: 죽은 task 재시도-슈퍼바이저(재시도는 ep0 재시작이라 비효율적이나 확률적 크래시라 몇 회 재시도로 완주 가능). 근본수리(osmesa 버전/GL 스택 교체)는 박스 관리자 개입 필요.
 
 ## 통합 서사 (Phase-A + Phase-B 종합)
 전체 계획(아키텍처 서치 → wrist) 완주. **모든 축에서 동일 결론**: frozen VL-잠재 변위 접지의 값은 **단순 관측-레벨 융합(concat/avg)의 삽입점 + 전처리**에 있고, 디코더/코드-측/역할분리/패치-관측/추가-변위-스트림(wrist) 등 **아키텍처 복잡화는 폐루프에서 일관되게 무익**. 이 강건한 단순성이 프레임워크의 핵심 서사.
