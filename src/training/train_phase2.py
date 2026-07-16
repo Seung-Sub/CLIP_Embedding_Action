@@ -88,7 +88,9 @@ def main():
                  contrast_loss=p1["model"].get("contrast_loss", "infonce"),
                  contrast_head=p1["model"].get("contrast_head", False),
                  sigmoid_bias0=p1["model"].get("sigmoid_bias0", -5.5),
-                 align_block=p1["model"].get("align_block")).to(device)
+                 align_block=p1["model"].get("align_block"),
+                 h_mode=p1["model"].get("h_mode", "mlp"),
+                 h_flow_steps=p1["model"].get("h_flow_steps", 5)).to(device)
     ae.load_state_dict(ck["state_dict"])
     ae.eval()
     for p in ae.parameters():

@@ -158,10 +158,15 @@ def main():
                     contrast_loss=m_cfg.get("contrast_loss", "infonce"),
                     contrast_head=m_cfg.get("contrast_head", False),
                     sigmoid_bias0=m_cfg.get("sigmoid_bias0", -5.5),
-                    align_block=m_cfg.get("align_block")).to(device)
+                    align_block=m_cfg.get("align_block"),
+                    h_mode=m_cfg.get("h_mode", "mlp"),
+                    h_flow_steps=m_cfg.get("h_flow_steps", 5)).to(device)
+    if model.h_mode == "flow":                    # S2: h-flow x0 스케일 = 액션청크 타깃 std
+        model.h.x0_std.fill_(float(np.asarray(C_tr).reshape(len(C_tr), -1).std()))
+        print(f"h-flow decoder: steps={model.h.steps}, x0_std={model.h.x0_std.item():.4f}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"DeltaAE params: {n_params/1e6:.2f}M (encoder cnn/{m_cfg['hidden']}x"
-          f"{m_cfg['layers']}, decoder mlp/{m_cfg['hidden']}x{m_cfg['layers']})")
+          f"{m_cfg['layers']}, decoder {model.h_mode}/{m_cfg['hidden']}x{m_cfg['layers']})")
     opt = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"],
                            betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
 

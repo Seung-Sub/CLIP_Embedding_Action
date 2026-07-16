@@ -57,7 +57,9 @@ def load_models(cfg, device):
                  contrast_loss=p1["model"].get("contrast_loss", "infonce"),
                  contrast_head=p1["model"].get("contrast_head", False),
                  sigmoid_bias0=p1["model"].get("sigmoid_bias0", -5.5),
-                 align_block=p1["model"].get("align_block")).to(device).eval()
+                 align_block=p1["model"].get("align_block"),
+                 h_mode=p1["model"].get("h_mode", "mlp"),
+                 h_flow_steps=p1["model"].get("h_flow_steps", 5)).to(device).eval()
     ae.load_state_dict(ck1["state_dict"])
     ck2 = torch.load(os.path.expanduser(cfg["train"]["checkpoint"]),
                      map_location="cpu", weights_only=False)

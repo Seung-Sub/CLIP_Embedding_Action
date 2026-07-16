@@ -62,12 +62,69 @@ class ChunkDecoder(nn.Module):
         return self.mlp(z).view(-1, self.n_chunk, self.action_dim)
 
 
+class ChunkFlowDecoder(nn.Module):
+    """(B, latent) [+ z_t] → (B, T, D)  — 조건부 flow-matching 디코더 (VITA FLD 완성).
+
+    결정론 MLP(ChunkDecoder)가 뭉개는 p(action | ζ, z_t)의 미세 다봉성을 분포로 모델링:
+    velocity field v(a_τ, τ | cond=[ζ, z_t]) 를 CFM으로 학습, 노이즈 x0 → 액션청크를 Euler K스텝 적분.
+    x0_std 버퍼 = 학습 시작 시 액션청크 타깃 std로 설정(FlowPolicy.x0_std 동형 — 스케일 정합).
+    forward(z, z_t) 는 ChunkDecoder 와 동일 인터페이스(샘플 반환)라 phase2/rollout 무변경 호환.
+    """
+
+    def __init__(self, action_dim, n_chunk, latent_dim=768, hidden=512,
+                 layers=4, dropout=0.0, state_cond=True, steps=5):
+        super().__init__()
+        self.state_cond = state_cond
+        self.n_chunk, self.action_dim, self.steps = n_chunk, action_dim, steps
+        self.a_dim = n_chunk * action_dim
+        cond_in = latent_dim * (2 if state_cond else 1)
+        self.cond = nn.Sequential(nn.LayerNorm(cond_in),
+                                  nn.Linear(cond_in, hidden), nn.GELU())
+        self.t_embed = nn.Sequential(nn.Linear(1, 128), nn.GELU(),
+                                     nn.Linear(128, 128))
+        net = [nn.Linear(self.a_dim + hidden + 128, hidden), nn.GELU()]
+        for _ in range(layers - 1):
+            net += [nn.Linear(hidden, hidden), nn.GELU()]
+            if dropout > 0:
+                net.append(nn.Dropout(dropout))
+        net.append(nn.Linear(hidden, self.a_dim))
+        self.v = nn.Sequential(*net)
+        self.register_buffer("x0_std", torch.ones(1))
+
+    def _ctx(self, z, z_t):
+        c = torch.cat([z, z_t], dim=1) if self.state_cond else z
+        return self.cond(c)
+
+    def _vel(self, a, ctx, t):
+        return self.v(torch.cat([a, ctx, self.t_embed(t)], dim=1))
+
+    def forward(self, z, z_t=None, generator=None):      # 샘플 (ChunkDecoder 호환)
+        ctx = self._ctx(z, z_t)
+        x = torch.randn((len(z), self.a_dim), device=z.device,
+                        generator=generator) * self.x0_std
+        dt = 1.0 / self.steps
+        for i in range(self.steps):
+            t = torch.full((len(x), 1), i * dt, device=x.device)
+            x = x + self._vel(x, ctx, t) * dt
+        return x.view(-1, self.n_chunk, self.action_dim)
+
+    def cfm_loss(self, chunk, z, z_t=None, generator=None):
+        """학습용 CFM 손실 — recon/cycle 의 L1 대체. target = 액션청크(평탄화)."""
+        ctx = self._ctx(z, z_t)
+        target = chunk.reshape(len(chunk), -1)
+        x0 = torch.randn_like(target) * self.x0_std
+        t = torch.rand((len(target), 1), device=target.device, generator=generator)
+        xt = (1 - t) * x0 + t * target
+        return nn.functional.mse_loss(self._vel(xt, ctx, t), target - x0)
+
+
 class DeltaAE(nn.Module):
     def __init__(self, action_dim, n_chunk, latent_dim=768, hidden=512,
                  layers=4, dropout=0.0, state_cond=True,
                  decoder_state_cond=None, encoder_state_cond=None,
                  align_mode="dz", contrast_w=0.0, contrast_loss="infonce",
-                 contrast_head=False, sigmoid_bias0=-5.5, align_block=None):
+                 contrast_head=False, sigmoid_bias0=-5.5, align_block=None,
+                 h_mode="mlp", h_flow_steps=5):
         """decoder_state_cond/encoder_state_cond: h/g 각각 독립적으로 상태조건을
         끄기 위한 오버라이드. None이면 state_cond와 동일(기존 동작 유지).
           decoder_state_cond=False (C0) : h가 z_t 없이도 되는지 (실측: 거의 무손실)
@@ -82,8 +139,15 @@ class DeltaAE(nn.Module):
         dec_cond = state_cond if decoder_state_cond is None else decoder_state_cond
         self.g = ChunkEncoder(action_dim, latent_dim, hidden, layers,
                               dropout, enc_cond)
-        self.h = ChunkDecoder(action_dim, n_chunk, latent_dim, hidden,
-                              layers, dropout, dec_cond)
+        # h_mode: mlp(기본, 결정론 조건평균) | flow(S2, 조건부 flow-matching 디코더 — 미세 다봉성).
+        assert h_mode in ("mlp", "flow"), h_mode
+        self.h_mode = h_mode
+        if h_mode == "flow":
+            self.h = ChunkFlowDecoder(action_dim, n_chunk, latent_dim, hidden,
+                                      layers, dropout, dec_cond, steps=h_flow_steps)
+        else:
+            self.h = ChunkDecoder(action_dim, n_chunk, latent_dim, hidden,
+                                  layers, dropout, dec_cond)
         assert align_mode in ("dz", "direct", "hybrid"), align_mode
         self.align_mode = align_mode
         # S1b: 융합 ζ(예: dualconcat 2048)의 SigLIP2 블록[0:align_block]만 모션문장 InfoNCE
@@ -134,16 +198,20 @@ class DeltaAE(nn.Module):
         text_emb/sent_ids: align_mode∈{direct,hybrid}일 때 모션문장 정렬용 (그 외 무시).
         dz 경로(기본)는 아래 total 합산식이 기존과 완전 동일 → 비트 동형 보존."""
         ghat = self.g(chunk, z_t)                # 액션(+상태) → 잠재
-        ahat = self.h(delta_z, z_t)              # 실제 Δz(+상태) → 액션 (FLD 대응)
-        acyc = self.h(ghat, z_t)                 # 왕복 (phase2 디코딩 경로)
         if align_type == "l1":
             l_align = nn.functional.l1_loss(ghat, delta_z)
         else:
             cos = nn.functional.cosine_similarity(ghat, delta_z, dim=1)
             l_align = (nn.functional.mse_loss(ghat, delta_z)
                        + 0.5 * (1 - cos).mean())
-        l_recon = nn.functional.l1_loss(ahat, chunk)
-        l_cycle = nn.functional.l1_loss(acyc, chunk)
+        if self.h_mode == "flow":                # S2: recon/cycle = 조건부 CFM (L1 대체)
+            l_recon = self.h.cfm_loss(chunk, delta_z, z_t)   # p(a | Δz, z_t)
+            l_cycle = self.h.cfm_loss(chunk, ghat, z_t)      # p(a | g(a), z_t), grad→g
+        else:
+            ahat = self.h(delta_z, z_t)          # 실제 Δz(+상태) → 액션 (FLD 대응)
+            acyc = self.h(ghat, z_t)             # 왕복 (phase2 디코딩 경로)
+            l_recon = nn.functional.l1_loss(ahat, chunk)
+            l_cycle = nn.functional.l1_loss(acyc, chunk)
         if self.align_mode == "direct":         # dz-align 제외 (대조 정렬만)
             total = w["recon"] * l_recon + w["cycle"] * l_cycle
             parts = {"recon": l_recon.item(), "cycle": l_cycle.item()}

@@ -1,0 +1,52 @@
+# Phase 1 (LIBERO) — S2: concat 융합 DeltaAE + h-flow 디코더 (VITA FLD 완성).
+# ══════════════════════════════════════════════════════════════════════════
+# cowork F5-H S2 / 사용자 제안: 결정론 MLP h(조건평균=뭉갬)를 조건부 flow-matching 디코더로 교체.
+#   g(action→ζ)는 유지, h(ζ,z_t→action)만 flow. recon/cycle 손실 = L1 → CFM 자동 전환(networks.py).
+#   근거: granularity fine R²<1(잔차 다봉성) → MLP가 평균내는 것을 flow가 일관 궤적으로 샘플.
+#   기질 = 최고 성능 concat 융합(dualconcat 2048). fused z 캐시(fobsfusion_concat) 재사용.
+#   대조 = phase1_libero_fobsfusion_concat.pt (동일 g, h만 MLP).
+#   실행: python src/training/train_phase1.py --config configs/phase1_libero_s2_concat_hflow.yaml
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # concat 캐시 재사용
+
+anchor:
+  name: dualconcat
+  projection: joint
+  normalize: false
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+
+model:
+  latent_dim: 768              # train_phase1.py가 anchor.dim(2048)으로 자동 덮어씀
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+  h_mode: flow                 # ★ h = 조건부 flow-matching 디코더 (기본 mlp 대체)
+  h_flow_steps: 5              # 추론 Euler 스텝 (cowork 권고 K≤5)
+
+loss:
+  align: 0.5                   # g: dz-align (full ζ 2048)
+  recon: 0.5                   # h-flow CFM: p(a | Δz, z_t)
+  cycle: 0.25                  # h-flow CFM: p(a | g(a), z_t)
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_s2_concat_hflow.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_s2_concat_hflow}
