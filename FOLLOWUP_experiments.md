@@ -100,7 +100,7 @@
 
 - **콜리그(SigLIP 폴더) 새 pull 재분석**: (a) concat=구현/레짐 특이(fusion-mode 아님, matched avg 69.8 vs concat 65.0 ~5pp) — **우리와 독립 수렴**. (b) DINOv2-vs-DINOv3를 2차 요인 강등 — 우리와 수렴. (c) offline≠SR: 디코더 ∂h/∂ζ eff-rank≈5.5/1024 → action-R²가 SR 추종, latent-cos는 역순위.
 - **actionflow (그들 유일 승자-초과, 97.2)**: `flow_space=action` — phase2 정책이 **raw 액션청크(112d)를 직접 flow transport, 동결 MLP h를 추론서 완전 우회.** 우리 h-flow(디코더 뒤 flow=그들 버린 M7)와 **다른 방식**. 구현·검증(latent 비트동형)·커밋 후 우리 concat·avg에 검정.
-  - **결과 = 음성(우리 파이프라인)**: af-concat **80.5%**(vs latent-concat 97.5, −17pp) / af-avg **82.7%**(vs latent-avg 91.5, −9pp) — **양팔 모두 하락.** 콜리그의 +0.8pp(96.4→97.2, 단일시드 밴드 내)가 우리에겐 반대 부호.
+  - **결과 = 음성(우리 파이프라인, correct 200롤 완주)**: af-concat **76%**(151/200, correct−wrong +20pp) / af-avg **80%**(159/200, correct−wrong ~+50pp) — **SR·언어 양축 모두 하락**(latent-concat 97.5/+69, latent-avg 91.5/+74 대비). 콜리그의 +0.8pp(96.4→97.2, 단일시드 밴드 내)가 우리에겐 반대 부호.
   - **해석**: 우리 값은 **변위잠재(ζ) 접지**에 있고 actionflow는 **ζ를 버려 raw 액션공간서 flow** → 접지 구조 상실 = 손해. **h는 병목이 아니라 필수**(ζ→h 접지가 우리 기여 핵심). → **actionflow는 우리 thesis와 배치**되며, 이 음성이 오히려 "변위잠재 접지가 값의 원천"을 강화. (구현 정상성: af-avg 초기 4태스크 91%≈latent가 방증 — 하락은 실제, 버그 아님.)
   - *ops 노트: HF Hub 504 반복 → HF_HUB_OFFLINE=1 기본화; killed-proc zombie GPU 메모리 1회 watchdog docker restart로 해소.*
 
