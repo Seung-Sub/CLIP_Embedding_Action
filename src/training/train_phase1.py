@@ -246,6 +246,16 @@ def main():
         acyc = model.h(model.g(Cv, Zv), Zv).cpu().numpy().reshape(len(Cv), -1)
     Cva = C_va.reshape(len(C_va), -1)
     dec_r2, cyc_r2 = r2(Cva, ahat), r2(Cva, acyc)
+    if getattr(model, "h_mode", "mlp") == "flow":   # 생성 디코더: 단일샘플 R²는 낮음(분포서 모드 샘플).
+        with torch.no_grad():                        #   K샘플 평균-R²가 MLP급이면 수렴·조건분산(다봉), 낮으면 미수렴.
+            K = 32
+            gz = model.g(Cv, Zv)
+            mrec = np.mean([model.h(Dv, Zv).cpu().numpy().reshape(len(Cv), -1)
+                            for _ in range(K)], axis=0)
+            mcyc = np.mean([model.h(gz, Zv).cpu().numpy().reshape(len(Cv), -1)
+                            for _ in range(K)], axis=0)
+        print(f"[h-flow K={K} 평균] recon 평균-R² = {r2(Cva, mrec):+.3f} / "
+              f"cycle 평균-R² = {r2(Cva, mcyc):+.3f} (단일 {dec_r2:+.3f}/{cyc_r2:+.3f})")
     # 맵핑 정렬도: g(a)와 실제 Δz의 평균 cosine
     align_cos = float(np.mean(
         (ghat * T_va).sum(1)
