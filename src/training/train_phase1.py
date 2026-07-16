@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from core import chunkrep
 from core.anchor import get_anchor
 from data import get_dataset
-from models.networks import DeltaAE
+from models.networks import DeltaAE, DualDeltaAE
 
 WS = Path(__file__).resolve().parents[2]
 CFG_PATH = WS / "configs" / "phase1.yaml"
@@ -55,6 +55,188 @@ def apply_override(cfg, kv):
     node[parts[-1]] = yaml.safe_load(val)
 
 
+def run_dual(cfg, args):
+    """Phase1 dual-stream 변위 AE 학습 (model.dual_stream=true 전용).
+
+    카메라별 분리 앵커·인코더: agentview(anchor) + wrist(anchor_wrist, 예 DINOv3).
+      g_main(a,z_main)→ζ_main≈Δz_main / g_wrist(a,z_wrist)→ζ_wrist≈Δz_wrist,
+      h([ζ_main;ζ_wrist],[z_main;z_wrist])→액션청크 (DualDeltaAE).
+    단일 스트림 경로(main)와 완전 분리 — 단일 런은 이 함수를 절대 타지 않음."""
+    t_cfg, m_cfg, w = cfg["train"], cfg["model"], cfg["loss"]
+    rng = np.random.RandomState(t_cfg["seed"])
+    torch.manual_seed(t_cfg["seed"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    ds = get_dataset(cfg)
+    files = ds.episode_files()
+    if args.smoke:
+        files = files[:2]
+    perm = rng.permutation(len(files))
+    v = cfg["data"]["val_episodes"]
+    n_val = 1 if args.smoke else (max(1, round(len(files) * v)) if v < 1 else int(v))
+    val_ids, tr_ids = perm[:n_val], perm[n_val:]
+    print(f"[dual] episodes: train {len(tr_ids)} / val {len(val_ids)}")
+
+    clip_main = get_anchor(cfg)
+    clip_wrist = get_anchor({"anchor": cfg["anchor_wrist"]})
+    dim_main, dim_wrist = clip_main.dim, clip_wrist.dim
+    assert dim_main and dim_wrist, "dual: 두 앵커 모두 pooled dim 필요 (dinov3는 pooled: cls|clsmp)"
+    print(f"[dual] anchor_main={clip_main.cache_key} (dim {dim_main}) / "
+          f"anchor_wrist={clip_wrist.cache_key} (dim {dim_wrist})")
+    print("인코딩/캐시 로드 중...")
+    eps = ds.build(clip_main, files, verbose=False, wrist_anchor=clip_wrist)
+
+    def stack(ids):
+        return tuple(np.concatenate([eps[i][k] for i in ids])
+                     for k in range(len(eps[0])))          # (Zt, Ztn, A, Zwt, Zwn)
+
+    Zt_tr, Ztn_tr, A_tr, Zwt_tr, Zwn_tr = stack(tr_ids)
+    Zt_va, Ztn_va, A_va, Zwt_va, Zwn_va = stack(val_ids)
+    n_chunk, act_dim = cfg["data"]["n_chunk"], A_tr.shape[1] // cfg["data"]["n_chunk"]
+
+    A_tr2 = A_tr.reshape(-1, act_dim)
+    a_mean = A_tr2.mean(0)
+    a_std = np.maximum(A_tr2.std(0), 1e-6)
+
+    def norm_chunks(A):
+        return ((A.reshape(len(A), n_chunk, act_dim) - a_mean) / a_std
+                ).astype(np.float32)
+
+    repr_kind = cfg["data"].get("chunk_repr", "time")
+    C_tr = chunkrep.to_repr(norm_chunks(A_tr), repr_kind)
+    C_va = chunkrep.to_repr(norm_chunks(A_va), repr_kind)
+    Dm_tr, Dm_va = Ztn_tr - Zt_tr, Ztn_va - Zt_va           # Δz_main
+    Dw_tr, Dw_va = Zwn_tr - Zwt_tr, Zwn_va - Zwt_va         # Δz_wrist
+    print(f"[dual] pairs: train {len(C_tr)} / val {len(C_va)} | chunk {n_chunk}x{act_dim} "
+          f"| Δz_main std {Dm_tr.std():.4f} / Δz_wrist std {Dw_tr.std():.4f}")
+
+    wb = None
+    wb_cfg = cfg.get("wandb", {})
+    if wb_cfg.get("enabled") and not args.smoke:
+        import wandb
+        wb = wandb.init(project=wb_cfg["project"], name=wb_cfg.get("run_name"),
+                        mode=wb_cfg.get("mode", "offline"), config=cfg)
+
+    model = DualDeltaAE(act_dim, n_chunk, dim_main, dim_wrist, m_cfg["hidden"],
+                        m_cfg["layers"], m_cfg["dropout"],
+                        m_cfg.get("state_cond", True)).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[dual] DualDeltaAE params: {n_params/1e6:.2f}M "
+          f"(g_main→{dim_main}, g_wrist→{dim_wrist}, h in {model.dim_cat}*2)")
+    opt = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"],
+                           betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
+
+    loader = DataLoader(
+        TensorDataset(torch.tensor(C_tr), torch.tensor(Dm_tr), torch.tensor(Dw_tr),
+                      torch.tensor(Zt_tr), torch.tensor(Zwt_tr)),
+        batch_size=t_cfg["batch_size"], shuffle=True, drop_last=False)
+    Cv = torch.tensor(C_va, device=device)
+    Dmv = torch.tensor(Dm_va, device=device)
+    Dwv = torch.tensor(Dw_va, device=device)
+    Zmv = torch.tensor(Zt_va, device=device)
+    Zwv = torch.tensor(Zwt_va, device=device)
+    epochs = 3 if args.smoke else t_cfg["epochs"]
+    best_val, best_state, patience = np.inf, None, 0
+
+    sched = None
+    if t_cfg.get("scheduler") == "cosine":
+        total_steps = max(1, epochs * len(loader))
+        warmup = t_cfg.get("warmup_steps", 500)
+
+        def lr_lambda(step):
+            if step < warmup:
+                return step / max(1, warmup)
+            p = (step - warmup) / max(1, total_steps - warmup)
+            return 0.5 * (1 + np.cos(np.pi * min(p, 1.0)))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+    align_type = m_cfg.get("align_type", "mse_cos")
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        logs, part_logs = [], []
+        for c_b, dm_b, dw_b, zm_b, zw_b in loader:
+            loss, parts = model.losses(c_b.to(device), dm_b.to(device),
+                                       dw_b.to(device), zm_b.to(device),
+                                       zw_b.to(device), w, align_type)
+            opt.zero_grad(); loss.backward(); opt.step()
+            if sched:
+                sched.step()
+            logs.append(loss.item()); part_logs.append(parts)
+        model.eval()
+        with torch.no_grad():
+            val_loss, val_parts = model.losses(Cv, Dmv, Dwv, Zmv, Zwv, w, align_type)
+        val_loss = val_loss.item()
+        if val_loss < best_val - 1e-5:
+            best_val, patience = val_loss, 0
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            patience += 1
+        if wb:
+            train_parts = {f"train/{k}": np.mean([p[k] for p in part_logs])
+                           for k in part_logs[0]}
+            wb.log({"epoch": ep, "train/total": np.mean(logs),
+                    "val/total": val_loss, **train_parts,
+                    **{f"val/{k}": v for k, v in val_parts.items()}})
+        if ep % 10 == 0 or ep == epochs - 1:
+            print(f"ep {ep:3d} | train {np.mean(logs):.4f} | val {val_loss:.4f} "
+                  f"({val_parts}) | patience {patience}")
+        if patience >= t_cfg["early_stop_patience"]:
+            print(f"early stop @ ep {ep}")
+            break
+    print(f"[dual] 학습 {time.time()-t0:.0f}s, best val {best_val:.4f}")
+    model.load_state_dict(best_state)
+
+    # ---- 평가 (held-out) : 디코더/왕복 R² + 스트림별 align cos ----
+    model.eval()
+    with torch.no_grad():
+        gm = model.g_main(Cv, Zmv); gw = model.g_wrist(Cv, Zwv)
+        ahat = model.decode(torch.cat([Dmv, Dwv], 1), Zmv, Zwv).cpu().numpy()
+        acyc = model.decode(torch.cat([gm, gw], 1), Zmv, Zwv).cpu().numpy()
+        gm_np, gw_np = gm.cpu().numpy(), gw.cpu().numpy()
+    ahat = ahat.reshape(len(Cv), -1); acyc = acyc.reshape(len(Cv), -1)
+    Cva = C_va.reshape(len(C_va), -1)
+    dec_r2, cyc_r2 = r2(Cva, ahat), r2(Cva, acyc)
+
+    def _cos(a, b):
+        return float(np.mean((a * b).sum(1) / (np.linalg.norm(a, axis=1)
+                     * np.linalg.norm(b, axis=1) + 1e-8)))
+    align_cos_m = _cos(gm_np, Dm_va)
+    align_cos_w = _cos(gw_np, Dw_va)
+    print(f"\n=== [dual] held-out 평가 ({len(C_va)} pairs) ===")
+    print(f"디코더 h(Δz->a)  R² = {dec_r2:+.3f}   [복구]")
+    print(f"cycle h(g(a))    R² = {cyc_r2:+.3f}   [복구]")
+    print(f"align cos main {align_cos_m:+.3f} / wrist {align_cos_w:+.3f}   [맵핑]")
+
+    metrics = {"decoder_r2": dec_r2, "cycle_r2": cyc_r2,
+               "align_cos_main": align_cos_m, "align_cos_wrist": align_cos_w,
+               "best_val_loss": float(best_val),
+               "n_train_pairs": len(C_tr), "n_val_pairs": len(C_va)}
+    ckpt_path = Path(os.path.expanduser(t_cfg["checkpoint"]))
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": best_state, "config": cfg,
+                "a_mean": a_mean, "a_std": a_std,
+                "action_dim": act_dim, "n_chunk": n_chunk,
+                "chunk_repr": repr_kind,
+                "dual_stream": True, "dim_main": dim_main, "dim_wrist": dim_wrist,
+                "latent_dim": model.dim_cat,
+                "anchor": {"id": clip_main.id, "cache_key": clip_main.cache_key},
+                "anchor_wrist": {"id": clip_wrist.id, "cache_key": clip_wrist.cache_key},
+                "metrics": metrics}, ckpt_path)
+    print(f"저장: {ckpt_path}")
+    if args.tag:
+        out = WS / "outputs" / "grid"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{args.tag}.json").write_text(json.dumps(
+            {"tag": args.tag, "overrides": args.set, **metrics}, indent=1))
+    if wb:
+        wb.summary.update({"decoder_r2": dec_r2, "cycle_r2": cyc_r2,
+                           "align_cos_main": align_cos_m,
+                           "align_cos_wrist": align_cos_w, "n_params": n_params})
+        wb.finish()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true", help="2 eps, 3 epochs 코드 점검")
@@ -73,6 +255,8 @@ def main():
         cfg["train"]["checkpoint"] = str(WS / f"checkpoints/grid/{args.tag}.pt")
         cfg["wandb"]["run_name"] = args.tag
     t_cfg, m_cfg, w = cfg["train"], cfg["model"], cfg["loss"]
+    if m_cfg.get("dual_stream"):        # dual-stream 변위 AE (손목캠 추론 스트림) — 별도 경로
+        return run_dual(cfg, args)      #   단일 스트림 아래 코드는 완전 무변경(비트 동형)
     rng = np.random.RandomState(t_cfg["seed"])
     torch.manual_seed(t_cfg["seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"

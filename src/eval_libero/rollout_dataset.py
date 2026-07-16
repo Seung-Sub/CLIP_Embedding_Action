@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 from core import chunkrep
 from core.anchor import get_anchor
 from data.libero import LiberoDataset
-from models.networks import DeltaAE
+from models.networks import DeltaAE, DualDeltaAE
 from models.policy import build_policy_from_cfg
 
 WS = Path(__file__).resolve().parents[2]
@@ -45,6 +45,8 @@ def load_models(cfg, device):
     ck1 = torch.load(os.path.expanduser(cfg["phase1_ckpt"]),
                      map_location="cpu", weights_only=False)
     p1 = ck1["config"]
+    if ck1.get("dual_stream"):
+        return _load_models_dual(cfg, device, ck1)
     ae = DeltaAE(ck1["action_dim"], ck1["n_chunk"], p1["model"]["latent_dim"],
                  p1["model"]["hidden"], p1["model"]["layers"],
                  p1["model"]["dropout"],
@@ -131,9 +133,39 @@ def load_models(cfg, device):
         f4 = f4.to(device).eval()
 
     # obs_anchors/obs_fusion/f4 는 해당 모듈일 때만 non-None; no-obs·no-f4 호출부는 *_로 무시.
+    # dual=None (단일 스트림) — dual 경로는 _load_models_dual 에서 13번째 원소로 dict 반환.
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, obs_anchors, obs_fusion, f4)
+            wrist_cam, obs_anchors, obs_fusion, f4, None)
+
+
+def _load_models_dual(cfg, device, ck1):
+    """dual-stream 모델 로드 (DualDeltaAE + FlowPolicy). load_models 와 동일 arity의
+    13-튜플 반환 — 13번째 dual dict 로 caller(rollout)가 wrist 앵커/dim_cat/디코딩 분기.
+    obs/f4/aug 는 dual 미지원 → 모두 None. wrist_cam 은 손목 프레임 인코딩용으로 반환."""
+    p1 = ck1["config"]
+    dim_main, dim_wrist = ck1["dim_main"], ck1["dim_wrist"]
+    dc = dim_main + dim_wrist
+    ae = DualDeltaAE(ck1["action_dim"], ck1["n_chunk"], dim_main, dim_wrist,
+                     p1["model"]["hidden"], p1["model"]["layers"],
+                     p1["model"]["dropout"],
+                     p1["model"].get("state_cond", True)).to(device).eval()
+    ae.load_state_dict(ck1["state_dict"])
+    ck2 = torch.load(os.path.expanduser(cfg["train"]["checkpoint"]),
+                     map_location="cpu", weights_only=False)
+    m = ck2["config"]["module"]
+    use_lang = m.get("lang_token", False)
+    policy = build_policy_from_cfg(m, n_tokens=5 + int(use_lang),
+                                   latent_dim=dc).to(device).eval()
+    policy.load_state_dict(ck2["state_dict"])
+    wrist_cam = ck2["config"]["data"].get("wrist_camera")
+    assert wrist_cam, "dual_stream: data.wrist_camera 필요"
+    dual = {"dim_main": dim_main, "dim_wrist": dim_wrist, "dim_cat": dc,
+            "anchor_wrist": ck2["config"]["anchor_wrist"]}
+    # use_lang 만 의미; use_wrist/obs/f4 는 dual 경로에서 미사용(None).
+    return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
+            ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
+            wrist_cam, None, None, None, dual)
 
 
 def sample_zeta(policy, f4, tokens, generator=None):
@@ -175,9 +207,10 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4, dual) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
+    clip_wrist = get_anchor({"anchor": dual["anchor_wrist"]}) if dual else None
 
     eps = ds.episode_files()
     rng = np.random.RandomState(cfg["train"]["seed"])
@@ -190,7 +223,9 @@ def main():
 
     acts = ds.load_actions(ep)
     Z = ds.embeddings(clip, ep)
-    Zw = ds.embeddings(clip, ep, wrist_cam) if wrist_cam else None
+    # dual: 손목 변위 스트림은 별도 anchor_wrist pooled (prev/cur); 단일: 손목 토큰(main clip).
+    Zw = ds.embeddings(clip_wrist if dual else clip, ep, wrist_cam) \
+        if (wrist_cam or dual) else None
     # F3: 앵커별 dense patch 토큰 D[t] (Z[t]=z_cur 와 동일 인덱스 정렬)
     D_obs = ([(name, ds.dense_embeddings(anc, ep, cam))
               for name, anc, cam in obs_anchors] if obs_fusion is not None else [])
@@ -210,17 +245,31 @@ def main():
             z_cur = torch.tensor(Z[t][None], device=device)
             past = chunkrep.to_repr(
                 norm(ds.resample_chunk(acts[t - span:t])), repr_kind)[None]
-            a_emb = ae.g(torch.tensor(past, device=device), z_prev)
-            toks = [z_prev, z_cur, a_emb] + ([lang] if use_lang else []) \
-                + ([torch.tensor(Zw[t][None], device=device)]
-                   if wrist_cam else [])
-            if obs_fusion is not None:                # F3: 관측 토큰 K개를 열 끝에 추가
-                obs_tok = obs_fusion({name: torch.tensor(D[t][None], device=device)
-                                      for name, D in D_obs})       # (1,K,768)
-                toks = toks + [obs_tok[:, k] for k in range(obs_tok.size(1))]
-            zeta = policy(torch.stack(toks, dim=1))
-            ahat = chunkrep.from_repr(ae.h(zeta, z_cur).cpu().numpy()[0],
-                                      repr_kind) * a_std + a_mean
+            past_t = torch.tensor(past, device=device)
+            if dual:                                  # dual-stream 변위 정책
+                dcw = dual["dim_cat"]
+                zwp = torch.tensor(Zw[t - span][None], device=device)
+                zwc = torch.tensor(Zw[t][None], device=device)
+                a_emb = ae.encode(past_t, z_prev, zwp)         # concat ζ_past (dc)
+                _pad = lambda x: torch.nn.functional.pad(x, (0, dcw - x.shape[-1]))
+                toks = [_pad(z_prev), _pad(z_cur), a_emb, _pad(zwp), _pad(zwc)] \
+                    + ([_pad(lang)] if use_lang else [])
+                zeta = policy(torch.stack(toks, dim=1))
+                ahat = chunkrep.from_repr(
+                    ae.decode(zeta, z_cur, zwc).cpu().numpy()[0],
+                    repr_kind) * a_std + a_mean
+            else:
+                a_emb = ae.g(past_t, z_prev)
+                toks = [z_prev, z_cur, a_emb] + ([lang] if use_lang else []) \
+                    + ([torch.tensor(Zw[t][None], device=device)]
+                       if wrist_cam else [])
+                if obs_fusion is not None:            # F3: 관측 토큰 K개를 열 끝에 추가
+                    obs_tok = obs_fusion({name: torch.tensor(D[t][None], device=device)
+                                          for name, D in D_obs})   # (1,K,768)
+                    toks = toks + [obs_tok[:, k] for k in range(obs_tok.size(1))]
+                zeta = policy(torch.stack(toks, dim=1))
+                ahat = chunkrep.from_repr(ae.h(zeta, z_cur).cpu().numpy()[0],
+                                          repr_kind) * a_std + a_mean
             n_exec = min(H, T - t)
             pred[t:t + n_exec] = ahat[:n_exec]
             t += H

@@ -71,7 +71,7 @@ def main():
         cfg["train"]["checkpoint"] = args.checkpoint
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
-     repr_kind, wrist_cam, obs_anchors, obs_fusion, f4) = load_models(cfg, device)
+     repr_kind, wrist_cam, obs_anchors, obs_fusion, f4, dual) = load_models(cfg, device)
     is_hflow = getattr(ae, "h_mode", "mlp") == "flow"   # h가 flow 디코더면 generator 전달 가능
     af = getattr(policy, "flow_space", "latent") == "action"   # ★SWAP: 정책 출력이 곧 액션 → ae.h BYPASS
     if af:
@@ -79,6 +79,7 @@ def main():
               "x0_src=과거 액션청크", flush=True)
     ds = LiberoDataset(cfg)          # span/resample 재사용
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
+    clip_wrist = get_anchor({"anchor": dual["anchor_wrist"]}) if dual else None
     # S1b 역할분리(cond_anchor): 조건 토큰=SigLIP2 서브블록[0:cond_dim] / g·h·ζ=융합 z 전체.
     # fused=dualconcat 이면 _sig.dim 재사용(추가 로드 없음). 없으면 cond_dim=None → 기존 비트 동형.
     cond_dim = None
@@ -145,7 +146,9 @@ def main():
         def encode_wrist(obs):
             img = obs["robot0_eye_in_hand_image"]
             img = img[::-1].copy() if args.flip else img
-            return clip.encode_images([Image.fromarray(img)])["embeds"][0]
+            # dual: 손목 변위 스트림은 anchor_wrist(예 DINOv3 pooled)로 인코딩. 단일: main clip.
+            enc = clip_wrist if dual else clip
+            return enc.encode_images([Image.fromarray(img)])["embeds"][0]
 
         def obs_toks(obs):
             """F3: 현재 프레임의 dense patch 토큰 → obs_fusion → K개 관측 토큰.
@@ -175,6 +178,9 @@ def main():
             past_actions = collections.deque([rest.copy() for _ in range(span)],
                                              maxlen=span)
             z_hist = collections.deque([encode(obs)], maxlen=span // H + 1)
+            # dual: 손목 변위 스트림 히스토리(prev/cur) — main z_hist 와 동일 규약.
+            zw_hist = (collections.deque([encode_wrist(obs)], maxlen=span // H + 1)
+                       if dual else None)
             frames, done, instructed, t = [], False, False, 0
             with torch.no_grad():
                 while t < args.max_steps and not done and not instructed:
@@ -182,43 +188,60 @@ def main():
                     past = ds.resample_chunk(np.stack(past_actions))
                     past = ((past - a_mean) / a_std).astype(np.float32)
                     past = chunkrep.to_repr(past, repr_kind)
-                    zp = torch.tensor(z_hist[0][None], device=device)
-                    zc = torch.tensor(z_hist[-1][None], device=device)
-                    a_emb = ae.g(torch.tensor(past[None], device=device), zp)  # g=융합 z 전체
-                    _zd = zp.shape[-1]                # 융합 폭 (S1b=2048); 슬라이스 전 확정
-                    # S1b: 조건 토큰(z_prev/z_cur/wrist)만 SigLIP2 서브블록[0:cond_dim]; aemb·h 는 융합 전체
-                    zp_c, zc_c = (zp[:, :cond_dim], zc[:, :cond_dim]) if cond_dim else (zp, zc)
-                    wr_t = torch.tensor(encode_wrist(obs)[None], device=device) if wrist_cam else None
-                    if wrist_cam and cond_dim:
-                        wr_t = wr_t[:, :cond_dim]
-                    toks = [zp_c, zc_c, a_emb] + ([lang] if use_lang else []) \
-                        + ([wr_t] if wrist_cam else [])
-                    if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
-                        toks = toks + obs_toks(obs)
-                    # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
-                    # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
-                    # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)
-                    toks = [t if t.shape[-1] == _zd else
-                            torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
-                    if af:   # ★SWAP: action-space flow. x0_src=과거 정규화 액션청크 flatten(=a_emb에 먹인
-                             # `past`, train_phase2 cp.reshape(len,-1) 동형). 정책 출력 ζ̂가 곧 액션청크
-                             # (n_chunk*act_dim) → ae.h 디코딩 없이 reshape(n_chunk,act_dim)→from_repr→invert.
-                        x0_src_t = torch.tensor(past.reshape(1, -1), device=device)
-                        zeta = policy(torch.stack(toks, dim=1), x0_src=x0_src_t)
+                    if dual:                          # dual-stream 변위 정책 (손목캠 추론)
+                        dcw = dual["dim_cat"]
+                        zp = torch.tensor(z_hist[0][None], device=device)
+                        zc = torch.tensor(z_hist[-1][None], device=device)
+                        zwp = torch.tensor(zw_hist[0][None], device=device)
+                        zwc = torch.tensor(zw_hist[-1][None], device=device)
+                        a_emb = ae.encode(torch.tensor(past[None], device=device),
+                                          zp, zwp)                 # concat ζ_past (dc)
+                        _pad = lambda x: torch.nn.functional.pad(   # noqa: E731
+                            x, (0, dcw - x.shape[-1]))
+                        toks = [_pad(zp), _pad(zc), a_emb, _pad(zwp), _pad(zwc)] \
+                            + ([_pad(lang)] if use_lang else [])
+                        zeta = policy(torch.stack(toks, dim=1))
                         ahat = chunkrep.from_repr(
-                            zeta.detach().cpu().numpy()[0].reshape(n_chunk, act_dim),
+                            ae.decode(zeta, zc, zwc).cpu().numpy()[0],
                             repr_kind) * a_std + a_mean
-                    else:    # 잠재 flow(그 외 전 config): 원본 경로 그대로(regression-0)
-                        zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
-                        if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
-                            zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
-                        ahat_lat = ae.h(zeta, zc, generator=ep_gen) if is_hflow \
-                            else ae.h(zeta, zc)          # frozen h(ζ_g, z_cur); flow면 에피소드 고정노이즈
-                        if f4 is not None:               # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
-                            ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
-                        ahat = chunkrep.from_repr(
-                            ahat_lat.cpu().numpy()[0], repr_kind) \
-                            * a_std + a_mean
+                    else:
+                        zp = torch.tensor(z_hist[0][None], device=device)
+                        zc = torch.tensor(z_hist[-1][None], device=device)
+                        a_emb = ae.g(torch.tensor(past[None], device=device), zp)  # g=융합 z 전체
+                        _zd = zp.shape[-1]                # 융합 폭 (S1b=2048); 슬라이스 전 확정
+                        # S1b: 조건 토큰(z_prev/z_cur/wrist)만 SigLIP2 서브블록[0:cond_dim]; aemb·h 는 융합 전체
+                        zp_c, zc_c = (zp[:, :cond_dim], zc[:, :cond_dim]) if cond_dim else (zp, zc)
+                        wr_t = torch.tensor(encode_wrist(obs)[None], device=device) if wrist_cam else None
+                        if wrist_cam and cond_dim:
+                            wr_t = wr_t[:, :cond_dim]
+                        toks = [zp_c, zc_c, a_emb] + ([lang] if use_lang else []) \
+                            + ([wr_t] if wrist_cam else [])
+                        if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
+                            toks = toks + obs_toks(obs)
+                        # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
+                        # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
+                        # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)
+                        toks = [t if t.shape[-1] == _zd else
+                                torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
+                        if af:   # ★SWAP: action-space flow. x0_src=과거 정규화 액션청크 flatten(=a_emb에 먹인
+                                 # `past`, train_phase2 cp.reshape(len,-1) 동형). 정책 출력 ζ̂가 곧 액션청크
+                                 # (n_chunk*act_dim) → ae.h 디코딩 없이 reshape(n_chunk,act_dim)→from_repr→invert.
+                            x0_src_t = torch.tensor(past.reshape(1, -1), device=device)
+                            zeta = policy(torch.stack(toks, dim=1), x0_src=x0_src_t)
+                            ahat = chunkrep.from_repr(
+                                zeta.detach().cpu().numpy()[0].reshape(n_chunk, act_dim),
+                                repr_kind) * a_std + a_mean
+                        else:    # 잠재 flow(그 외 전 config): 원본 경로 그대로(regression-0)
+                            zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
+                            if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
+                                zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
+                            ahat_lat = ae.h(zeta, zc, generator=ep_gen) if is_hflow \
+                                else ae.h(zeta, zc)          # frozen h(ζ_g, z_cur); flow면 에피소드 고정노이즈
+                            if f4 is not None:               # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
+                                ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
+                            ahat = chunkrep.from_repr(
+                                ahat_lat.cpu().numpy()[0], repr_kind) \
+                                * a_std + a_mean
                     ahat = np.clip(ahat, -1.0, 1.0)
                     infer_ms.append((time.time() - t0) * 1000)
                     for k in range(min(H, args.max_steps - t)):
@@ -234,6 +257,8 @@ def main():
                         if done or instructed:
                             break
                     z_hist.append(encode(obs))
+                    if dual:                         # 손목 변위 스트림도 재계획 주기마다 갱신
+                        zw_hist.append(encode_wrist(obs))
             ok = bool(done)                          # LIBERO: done == success (bowl_1)
             if is_swap:
                 instr, orig = bool(instructed), ok

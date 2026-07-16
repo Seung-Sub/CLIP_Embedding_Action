@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from core import chunkrep
 from core.anchor import get_anchor
 from data import get_dataset
-from models.networks import DeltaAE
+from models.networks import DeltaAE, DualDeltaAE
 from models.policy import FlowPolicy, build_policy_from_cfg, policy_losses
 
 WS = Path(__file__).resolve().parents[2]
@@ -47,6 +47,250 @@ def apply_override(cfg, kv):
     node[parts[-1]] = yaml.safe_load(val)
 
 
+def _pad_to(t, d):
+    """좁은 조건 토큰을 dc 폭의 앞블록에 zero-pad (dual 토큰 균일폭 stack용)."""
+    return t if t.shape[-1] == d else torch.nn.functional.pad(t, (0, d - t.shape[-1]))
+
+
+def run_dual(cfg, args):
+    """Phase2 dual-stream 정책 학습 (module.dual_stream=true 전용).
+
+    조건 토큰: [z_main_prev, z_main_cur, g(A_past), z_wrist_prev, z_wrist_cur, lang]
+      — 손목캠이 이제 prev+cur 두 토큰(별도 anchor_wrist pooled)으로 기여.
+      g(A_past)=ae.encode(A_past, z_main_prev, z_wrist_prev)=concat ζ_past(dim_cat).
+      토큰 폭은 모두 dim_cat 로 zero-pad(a_emb만 이미 dim_cat) → FlowPolicy stack 균일.
+    flow 타깃 = concat[ζ_main ; ζ_wrist] = ae.encode(A_fut, z_main_cur, z_wrist_cur)
+      (flow_dim=dim_cat). 디코딩 = ae.decode(ζ̂, z_main_cur, z_wrist_cur).
+    FlowPolicy 는 무변경 재사용(latent_dim=dim_cat). MLP 정책·action-flow·f4·obs·aug 는
+      dual 에서 미지원(assert). 단일 스트림 main() 은 이 함수를 절대 타지 않음(비트 동형)."""
+    t_cfg, m_cfg, w = cfg["train"], cfg["module"], cfg["loss"]
+    assert m_cfg.get("name") == "flow", "dual_stream: flow 정책 전제"
+    assert not m_cfg.get("obs") and not (m_cfg.get("f4") and m_cfg["f4"].get("enable")), \
+        "dual_stream: obs/f4 미지원 (단일 dense 채널 실험과 배타)"
+    assert m_cfg.get("flow_space", "latent") == "latent", "dual_stream: action-flow 미지원"
+    rng = np.random.RandomState(t_cfg["seed"])
+    torch.manual_seed(t_cfg["seed"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ---- phase1 dual 동결 모델 ----
+    ck = torch.load(os.path.expanduser(cfg["phase1_ckpt"]),
+                    map_location="cpu", weights_only=False)
+    assert ck.get("dual_stream"), "dual_stream phase2 는 dual phase1 ckpt 필요"
+    p1 = ck["config"]
+    n_chunk, act_dim = ck["n_chunk"], ck["action_dim"]
+    a_mean, a_std = ck["a_mean"], ck["a_std"]
+    repr_kind = ck.get("chunk_repr", "time")
+    dim_main, dim_wrist = ck["dim_main"], ck["dim_wrist"]
+    dc = dim_main + dim_wrist
+    ae = DualDeltaAE(act_dim, n_chunk, dim_main, dim_wrist,
+                     p1["model"]["hidden"], p1["model"]["layers"],
+                     p1["model"]["dropout"],
+                     p1["model"].get("state_cond", True)).to(device)
+    ae.load_state_dict(ck["state_dict"])
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
+
+    # ---- 데이터 (main + wrist 삼중쌍) ----
+    ds = get_dataset(cfg)
+    assert not (ds.aug_view or ds.aug_wrist), "dual_stream: aug 미지원 (no-aug clean 전용)"
+    files = ds.episode_files()
+    if args.smoke:
+        files = files[:2]
+    elif args.max_episodes:
+        sub = np.random.RandomState(0).permutation(len(files))[:args.max_episodes]
+        files = [files[i] for i in sub]
+    perm = rng.permutation(len(files))
+    v = cfg["data"]["val_episodes"]
+    n_val = 1 if args.smoke else (max(1, round(len(files) * v)) if v < 1 else int(v))
+    val_ids, tr_ids = perm[:n_val], perm[n_val:]
+    clip_main = get_anchor(cfg)
+    clip_wrist = get_anchor({"anchor": cfg["anchor_wrist"]})
+    assert clip_main.dim == dim_main and clip_wrist.dim == dim_wrist, \
+        f"앵커 dim 불일치: main {clip_main.dim}/{dim_main}, wrist {clip_wrist.dim}/{dim_wrist}"
+    print(f"[dual] anchor_main={clip_main.cache_key}({dim_main}) / "
+          f"anchor_wrist={clip_wrist.cache_key}({dim_wrist}) / dim_cat={dc}")
+    print("삼중쌍 구성 중 (임베딩 캐시 재사용)...")
+    eps = ds.build_policy_samples(clip_main, files,
+                                  stride=cfg["data"].get("stride", 2),
+                                  wrist_anchor=clip_wrist)
+
+    def stack(ids):
+        return tuple(np.concatenate([eps[i][k] for i in ids])
+                     for k in range(len(eps[0])))   # Zp,Zc,Zn,Ap,Af,Zwp,Zwc,Zwn
+
+    Zp_tr, Zc_tr, Zn_tr, Ap_tr, Af_tr, Zwp_tr, Zwc_tr, Zwn_tr = stack(tr_ids)
+    Zp_va, Zc_va, Zn_va, Ap_va, Af_va, Zwp_va, Zwc_va, Zwn_va = stack(val_ids)
+
+    use_lang = m_cfg.get("lang_token", False)
+    if use_lang:
+        lang_per_ep = [ds.instruction_embedding(clip_main, files[i])
+                       for i in range(len(files))]
+
+        def stack_lang(ids):
+            return np.concatenate([
+                np.repeat(lang_per_ep[i][None], len(eps[i][0]), axis=0)
+                for i in ids]).astype(np.float32)
+        L_tr, L_va = stack_lang(tr_ids), stack_lang(val_ids)
+
+    def norm(A):
+        a = ((A.reshape(len(A), n_chunk, act_dim) - a_mean) / a_std
+             ).astype(np.float32)
+        return chunkrep.to_repr(a, repr_kind)
+
+    Cp_tr, Cf_tr = norm(Ap_tr), norm(Af_tr)
+    Cp_va, Cf_va = norm(Ap_va), norm(Af_va)
+    print(f"[dual] samples: train {len(Cf_tr)} / val {len(Cf_va)} | chunk {n_chunk}x{act_dim}")
+
+    wb = None
+    wb_cfg = cfg.get("wandb", {})
+    if wb_cfg.get("enabled") and not args.smoke:
+        import wandb
+        wb = wandb.init(project=wb_cfg["project"], name=wb_cfg.get("run_name"),
+                        mode=wb_cfg.get("mode", "online"), config=cfg)
+
+    n_tokens = 5 + int(use_lang)      # [zp_m, zc_m, a_emb, zp_w, zc_w] (+lang)
+    model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens, latent_dim=dc).to(device)
+    assert isinstance(model, FlowPolicy) and model.flow_dim == dc
+    with torch.no_grad():             # x0_std = concat 잠재 타깃 분포
+        lt = ae.encode(torch.tensor(Cf_tr[:4096], device=device),
+                       torch.tensor(Zc_tr[:4096], device=device),
+                       torch.tensor(Zwc_tr[:4096], device=device))
+    model.x0_std.fill_(lt.std().item())
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[dual] policy[flow] params: {n_params/1e6:.2f}M | n_tokens={n_tokens} "
+          f"flow_dim={model.flow_dim} source={model.source} x0_std={model.x0_std.item():.4f}")
+    opt = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"],
+                           betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
+
+    past_noise = float(t_cfg.get("past_noise", 0.0))
+
+    def build_tokens(zp_m, zc_m, zwp, zwc, a_emb, lang):
+        toks = [_pad_to(zp_m, dc), _pad_to(zc_m, dc), a_emb,
+                _pad_to(zwp, dc), _pad_to(zwc, dc)]
+        if use_lang:
+            toks.append(_pad_to(lang, dc))
+        return torch.stack(toks, dim=1)
+
+    def forward(zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang, train=True):
+        with torch.no_grad():
+            a_emb = ae.encode(cp, zp_m, zwp)               # concat ζ_past (dc)
+            lat_target = ae.encode(cf, zc_m, zwc)          # flow 타깃 concat ζ (dc)
+        toks = build_tokens(zp_m, zc_m, zwp, zwc, a_emb, lang)
+        gen = None
+        if not train:
+            gen = torch.Generator(device=device); gen.manual_seed(0)
+        zeta, l_fm = model.fm_and_sample(toks, lat_target, generator=gen)
+        ahat = ae.decode(zeta, zc_m, zwc)                  # frozen dual 디코딩
+        wm_target = torch.cat([zn_m - zc_m, zwn - zwc], dim=1)   # dc
+        cos = torch.nn.functional.cosine_similarity
+        l_wm = 0.5 * (1 - cos(zeta, wm_target, dim=1)).mean()
+        l_act = torch.nn.functional.l1_loss(ahat, cf)
+        total = w["lat"] * l_fm + w["act"] * l_act + w["wm"] * l_wm
+        return total, {"lat": l_fm.item(), "act": l_act.item(), "wm": l_wm.item()}, zeta
+
+    L_tr_t = torch.tensor(L_tr) if use_lang else torch.zeros(len(Cp_tr), 0)
+    loader = DataLoader(
+        TensorDataset(torch.tensor(Zp_tr), torch.tensor(Zc_tr), torch.tensor(Zn_tr),
+                      torch.tensor(Cp_tr), torch.tensor(Cf_tr),
+                      torch.tensor(Zwp_tr), torch.tensor(Zwc_tr), torch.tensor(Zwn_tr),
+                      L_tr_t),
+        batch_size=t_cfg["batch_size"], shuffle=True)
+    val_t = [torch.tensor(x, device=device) for x in
+             (Zp_va, Zc_va, Zn_va, Cp_va, Cf_va, Zwp_va, Zwc_va, Zwn_va)]
+    val_t.append(torch.tensor(L_va, device=device) if use_lang
+                 else torch.zeros(len(Cf_va), 0, device=device))
+    epochs = 3 if args.smoke else t_cfg["epochs"]
+    best_val, best_state, patience = np.inf, None, 0
+
+    sched = None
+    if t_cfg.get("scheduler") == "cosine":
+        total_steps = max(1, epochs * len(loader))
+        warmup = t_cfg.get("warmup_steps", 500)
+
+        def lr_lambda(step):
+            if step < warmup:
+                return step / max(1, warmup)
+            prog = (step - warmup) / max(1, total_steps - warmup)
+            return 0.5 * (1 + np.cos(np.pi * min(prog, 1.0)))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        logs, parts_log = [], []
+        for batch in loader:
+            zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang = \
+                [b.to(device) for b in batch]
+            if past_noise > 0:
+                cp = cp + torch.randn_like(cp) * past_noise
+            loss, parts, _ = forward(zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang)
+            opt.zero_grad(); loss.backward(); opt.step()
+            if sched:
+                sched.step()
+            logs.append(loss.item()); parts_log.append(parts)
+        model.eval()
+        with torch.no_grad():
+            val_loss, val_parts, _ = forward(*val_t, train=False)
+        val_loss = val_loss.item()
+        if val_loss < best_val - 1e-5:
+            best_val, patience = val_loss, 0
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            patience += 1
+        if wb:
+            wb.log({"epoch": ep, "train/total": np.mean(logs), "val/total": val_loss,
+                    **{f"train/{k}": np.mean([x[k] for x in parts_log])
+                       for k in parts_log[0]},
+                    **{f"val/{k}": v for k, v in val_parts.items()}})
+        if ep % 10 == 0 or ep == epochs - 1:
+            print(f"ep {ep:3d} | train {np.mean(logs):.4f} | val {val_loss:.4f} "
+                  f"({val_parts}) | patience {patience}")
+        if patience >= t_cfg["early_stop_patience"]:
+            print(f"early stop @ ep {ep}")
+            break
+    print(f"[dual] 학습 {time.time()-t0:.0f}s, best val {best_val:.4f}")
+    model.load_state_dict(best_state)
+
+    # ---- 평가 ----
+    model.eval()
+    with torch.no_grad():
+        _, _, zeta = forward(*val_t, train=False)
+        ahat = ae.decode(zeta, val_t[1], val_t[6]).cpu().numpy()
+    Cf = Cf_va
+    act_r2 = r2(Cf.reshape(len(Cf), -1), ahat.reshape(len(ahat), -1))
+    gt = chunkrep.from_repr(Cf, repr_kind) * a_std + a_mean
+    pr = chunkrep.from_repr(ahat, repr_kind) * a_std + a_mean
+    if act_dim == 14:
+        arm = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+        grip, g_thr, unit = [6, 13], 0.5, 180 / np.pi
+    else:
+        arm = list(range(act_dim - 1))
+        grip, g_thr, unit = [act_dim - 1], 0.0, 1.0
+    mae_deg = float(np.abs(pr[:, :, arm] - gt[:, :, arm]).mean() * unit)
+    grip_acc = float(((pr[:, :, grip] > g_thr) == (gt[:, :, grip] > g_thr)).mean() * 100)
+    print(f"\n=== [dual] 정책 평가 ({len(Cf)} samples) ===")
+    print(f"관절 MAE {mae_deg:.2f}°/step | 그리퍼 {grip_acc:.1f}% | 액션 R² {act_r2:+.3f}")
+
+    metrics = {"score": -mae_deg, "mae_deg": mae_deg, "grip_acc": grip_acc,
+               "action_r2": act_r2, "best_val_loss": float(best_val),
+               "n_params": n_params, "n_val": len(Cf)}
+    ckpt_path = Path(os.path.expanduser(t_cfg["checkpoint"]))
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": best_state, "config": cfg, "metrics": metrics,
+                "obs_fusion": None, "f4": None}, ckpt_path)
+    print(f"저장: {ckpt_path}")
+    if args.tag:
+        out = WS / "outputs" / "grid"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{args.tag}.json").write_text(json.dumps(
+            {"tag": args.tag, "overrides": args.set, **metrics}, indent=1))
+    if wb:
+        wb.summary.update(metrics)
+        wb.finish()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
@@ -64,6 +308,8 @@ def main():
         cfg["train"]["checkpoint"] = str(WS / f"checkpoints/grid/{args.tag}.pt")
         cfg["wandb"]["run_name"] = args.tag
     t_cfg, m_cfg, w = cfg["train"], cfg["module"], cfg["loss"]
+    if m_cfg.get("dual_stream"):        # dual-stream 변위 정책 (손목캠 추론 스트림) — 별도 경로
+        return run_dual(cfg, args)      #   단일 스트림 아래 코드는 완전 무변경(비트 동형)
     # ★SWAP: action-space flow. module.flow_space='action'이면 CFM이 잠재 대신 RAW 액션청크를 직접
     # 수송(target=cf flatten, source='past'=과거 액션청크 flatten, 생성 ζ̂가 곧 액션 → ae.h 디코딩 BYPASS).
     # 기본 'latent'=현행 그대로(regression-0). ζ̂가 잠재가 아니라 액션이므로 잠재 Δz(wm)·f4(잠재 fine)와 비호환.

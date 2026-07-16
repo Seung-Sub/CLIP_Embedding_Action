@@ -227,3 +227,70 @@ class DeltaAE(nn.Module):
             total = total + cw * l_con
             parts["contrast"] = l_con.item()
         return total, parts
+
+
+class DualDeltaAE(nn.Module):
+    """Dual-stream displacement AE (손목캠 = 추론 변위 스트림, cowork dual_stream).
+
+    단일 스트림 DeltaAE(agentview만)와 달리 **카메라별로 분리된** 인코더 2개가
+    각자 액션청크(+해당 카메라 상태)를 그 카메라 잠재 변위로 매핑한다:
+        g_main (a, z_main_cur) → ζ_main ≈ Δz_main   (agentview, 예: SigLIP2)
+        g_wrist(a, z_wrist_cur)→ ζ_wrist≈ Δz_wrist   (wrist,     예: DINOv3 접촉/기하)
+    액션은 **두 변위를 함께** 디코딩 — 단일 h가 concat 변위와 concat 상태를 받는다:
+        h([ζ_main ; ζ_wrist], [z_main_cur ; z_wrist_cur]) → 액션청크.
+    (widened ChunkDecoder 재사용: latent_dim=dim_main+dim_wrist. ζ_main·ζ_wrist가
+     각자 Δz_main·Δz_wrist를 근사하므로 concat 잠재폭 == concat 상태폭 = dim_cat →
+     ChunkDecoder의 in_dim=dim_cat*2 규약이 그대로 성립. 두 h를 합산하는 대안보다
+     상태-변위 교차조건을 한 MLP가 학습하므로 단순·정확.)
+
+    손실 = w_align·(align_main + align_wrist) + w_recon·recon + w_cycle·cycle.
+      align_main/wrist: ζ_·≈Δz_· (각 카메라 잠재공간, MSE+0.5·(1−cos) 또는 L1)
+      recon/cycle     : 두 변위를 함께 디코딩한 단일 액션청크에 대한 L1 (VITA 동형).
+    이 클래스는 dual_stream 경로에서만 인스턴스화된다 — 위 단일 DeltaAE는 무변경
+    (비트 동형). h_mode="mlp" 속성은 rollout/phase2의 getattr(ae,"h_mode") 호환용."""
+
+    def __init__(self, action_dim, n_chunk, dim_main, dim_wrist, hidden=512,
+                 layers=4, dropout=0.0, state_cond=True):
+        super().__init__()
+        self.dim_main = int(dim_main)
+        self.dim_wrist = int(dim_wrist)
+        self.dim_cat = self.dim_main + self.dim_wrist
+        self.h_mode = "mlp"                       # rollout/phase2 호환 (분포 디코더 아님)
+        self.g_main = ChunkEncoder(action_dim, self.dim_main, hidden, layers,
+                                   dropout, state_cond)
+        self.g_wrist = ChunkEncoder(action_dim, self.dim_wrist, hidden, layers,
+                                    dropout, state_cond)
+        self.h = ChunkDecoder(action_dim, n_chunk, self.dim_cat, hidden, layers,
+                              dropout, state_cond)
+
+    def encode(self, chunk, z_main, z_wrist):
+        """액션청크 → concat 변위 ζ=[ζ_main ; ζ_wrist] (dim_cat). phase2 flow 타깃."""
+        return torch.cat([self.g_main(chunk, z_main),
+                          self.g_wrist(chunk, z_wrist)], dim=1)
+
+    def decode(self, zeta_cat, z_main, z_wrist):
+        """concat 변위(dim_cat) + concat 상태 → 액션청크. phase2/rollout 디코딩 경로."""
+        return self.h(zeta_cat, torch.cat([z_main, z_wrist], dim=1))
+
+    @staticmethod
+    def _align(ghat, dz, align_type):
+        if align_type == "l1":
+            return nn.functional.l1_loss(ghat, dz)
+        cos = nn.functional.cosine_similarity(ghat, dz, dim=1)
+        return nn.functional.mse_loss(ghat, dz) + 0.5 * (1 - cos).mean()
+
+    def losses(self, chunk, dz_main, dz_wrist, z_main, z_wrist, w,
+               align_type="mse_cos"):
+        gm = self.g_main(chunk, z_main)
+        gw = self.g_wrist(chunk, z_wrist)
+        l_am = self._align(gm, dz_main, align_type)
+        l_aw = self._align(gw, dz_wrist, align_type)
+        zt_cat = torch.cat([z_main, z_wrist], dim=1)
+        ahat = self.h(torch.cat([dz_main, dz_wrist], dim=1), zt_cat)   # real Δz → a
+        acyc = self.h(torch.cat([gm, gw], dim=1), zt_cat)             # 왕복 (grad→g)
+        l_recon = nn.functional.l1_loss(ahat, chunk)
+        l_cycle = nn.functional.l1_loss(acyc, chunk)
+        total = (w["align"] * (l_am + l_aw)
+                 + w["recon"] * l_recon + w["cycle"] * l_cycle)
+        return total, {"align_main": l_am.item(), "align_wrist": l_aw.item(),
+                       "recon": l_recon.item(), "cycle": l_cycle.item()}

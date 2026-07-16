@@ -1,0 +1,64 @@
+# Phase 2 (LIBERO) — DUAL-STREAM 변위 정책 (손목캠 = 추론 변위 스트림), no-aug clean
+# ══════════════════════════════════════════════════════════════════════════
+# module.dual_stream=true 전용 경로 (train_phase2.run_dual). dual_stream 없으면
+#   기존 단일 스트림 경로 = 비트 동형 (train_phase2.main).
+# 조건 토큰: [z_main_prev, z_main_cur, g(A_past), z_wrist_prev, z_wrist_cur, lang]
+#   — 손목캠이 prev+cur 두 토큰(anchor_wrist pooled)으로 기여 (기존 단일 wrist 토큰 아님).
+# flow 타깃 = concat[ζ_main;ζ_wrist] (flow_dim=dim_cat=2048), 디코딩=ae.decode(dual h).
+# no-aug: data.augment 없음 (dual은 aug 미지원 — run_dual assert).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_dualstream_wrist.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb        # dual 손목 변위 스트림 (필수)
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256   # phase1과 동일 (main/wrist cache_key 분리)
+
+anchor:                                # main (phase1과 동일)
+  name: siglip2
+  model_dir: google/siglip2-large-patch16-256
+  projection: joint
+  normalize: false
+
+anchor_wrist:                          # wrist (phase1과 동일)
+  name: dinov3
+  model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+  pooled: cls
+  normalize: true
+
+module:
+  name: flow                           # dual은 flow 전용 (run_dual assert)
+  flow_source: past                    # x0 = g(A_past) = concat ζ_past (토큰 idx 2)
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true                     # 멀티태스크 언어 조건화
+  dual_stream: true                    # ★ dual-stream 경로 활성
+
+loss:
+  lat: 0.5                             # concat ζ CFM
+  act: 1.0                             # dual h 디코딩 액션 L1
+  wm: 0.0                              # (auxiliary; concat Δz cos)
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_dualstream_wrist.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_dualstream_wrist}

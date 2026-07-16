@@ -241,7 +241,13 @@ class LiberoDataset:
         w = (src - lo)[:, None]
         return seg[lo] * (1 - w) + seg[hi] * w
 
-    def build(self, clip, files=None, verbose=True):
+    def build(self, clip, files=None, verbose=True, wrist_anchor=None):
+        """phase1 학습쌍 (Zt, Ztn, A). agentview 단일 스트림(기본).
+
+        wrist_anchor: dual_stream 손목 변위 스트림용 (별도 pooled 앵커). 주어지면
+        동일 starts에 정렬된 손목캠 cur/next 임베딩 (Zwt, Zwn)을 4·5번째로 덧붙여
+        Δz_wrist = Zwn − Zwt 가 정의되게 한다. None(기본)이면 출력은 기존과 완전
+        동일한 3-튜플 (byte-identical)."""
         files = files or self.episode_files()
         out = []
         for ep in files:
@@ -253,14 +259,19 @@ class LiberoDataset:
             Ztn = np.stack([Z[t + self.span] for t in starts])
             A = np.stack([self.resample_chunk(acts[t:t + self.span]).ravel()
                           for t in starts])
-            out.append((Zt.astype(np.float32), Ztn.astype(np.float32),
-                        A.astype(np.float32)))
+            arrs = [Zt, Ztn, A]
+            if wrist_anchor is not None:             # dual: 손목 cur/next (동일 starts 정렬)
+                assert self.wrist_camera, "dual_stream: data.wrist_camera 필요"
+                Zw = self.embeddings(wrist_anchor, ep, self.wrist_camera)
+                arrs += [np.stack([Zw[t] for t in starts]),
+                         np.stack([Zw[t + self.span] for t in starts])]
+            out.append(tuple(x.astype(np.float32) for x in arrs))
             if verbose:
                 print(f"  {self._key(ep)}: T={T}, pairs {len(starts)}")
         return out
 
     def build_policy_samples(self, clip, files=None, stride=2, obs_anchors=None,
-                             f4_anchor=None):
+                             f4_anchor=None, wrist_anchor=None):
         """연속 윈도우 삼중쌍 (경계 포함 — 롤아웃 부트스트랩 분포 커버).
 
         obs_anchors: [(name, anchor, camera), ...] (F3 obs-fusion). 주어지면 각
@@ -305,7 +316,13 @@ class LiberoDataset:
             Af = np.stack([self.resample_chunk(acts[t:t + self.span]).ravel()
                            for t in starts])
             arrs = [Zp, Zc, Zn, Ap, Af]
-            if self.wrist_camera:                    # 6번째: 손목캠 z_t (정책 토큰용)
+            if wrist_anchor is not None:             # dual_stream: 손목 변위 스트림 (prev/cur/next)
+                assert self.wrist_camera, "dual_stream: data.wrist_camera 필요"
+                Zw = self.embeddings(wrist_anchor, ep, self.wrist_camera)     # 별도 pooled 앵커
+                arrs += [np.stack([Zw[max(t - self.span, 0)] for t in starts]),
+                         np.stack([Zw[t] for t in starts]),
+                         np.stack([Zw[t + self.span] for t in starts])]       # 6·7·8번째
+            elif self.wrist_camera:                  # 단일 스트림: 손목캠 z_t (정책 토큰용, 6번째)
                 if wrist_aug:
                     Zw = self.cam_aug_embeddings(clip, ep, self.wrist_camera,
                                                  variants=wrist_aug)          # (T,M,D)

@@ -206,7 +206,7 @@ class Dinov3Anchor(BaseAnchor):
     patch_dim = 1024
 
     def __init__(self, projection="pre", normalize=False, model_dir=None,
-                 force_size=256, pool_to=None):
+                 force_size=256, pool_to=None, pooled=None):
         super().__init__("pre", normalize)             # joint 공간 없음 → pre 고정
         from transformers import AutoImageProcessor, AutoModel
         src = model_dir or "facebook/dinov3-vitl16-pretrain-lvd1689m"
@@ -233,16 +233,29 @@ class Dinov3Anchor(BaseAnchor):
         self.id = f"dinov3-vitl16-{self.force_size}"
         if self.pool_to:
             self.id += f"-pool{self.pool_to}"          # 별도 dense 캐시 키
+        # dual_stream(손목캠 변위 스트림): DINOv3는 native로 dense patch만 노출(embeds=None)
+        #   → pooled 임베딩이 필요한 dual 손목 앵커용으로 CLS(또는 CLS⊕patch-mean) pooled를
+        #   옵션 반환. pooled=None(기본)이면 embeds=None·id 불변 → 기존 dense 경로 비트 동형.
+        assert pooled in (None, "cls", "clsmp"), pooled
+        self.pooled = pooled
+        if pooled:
+            self.id += f"-{pooled}"                    # 별도 pooled 캐시 키 (dense와 분리)
+            self.dim = self.model.config.hidden_size * (2 if pooled == "clsmp" else 1)
 
     @torch.no_grad()
     def encode_images(self, pil_images):
         import torch.nn.functional as F
-        toks = []
+        toks, embs = [], []
         for i in range(0, len(pil_images), 16):        # OOM 안전 서브배치 (512 fp32)
             inp = self.processor(images=pil_images[i:i + 16], return_tensors="pt",
                                  size=self._size).to(self.device)
             out = self.model(pixel_values=inp["pixel_values"].to(self.model.dtype))
             t = out.last_hidden_state[:, self.n_prefix:, :]     # drop CLS+regs → (B,P,1024)
+            if self.pooled:                             # dual 손목 pooled: CLS(+patch-mean)
+                cls = out.last_hidden_state[:, 0]
+                if self.pooled == "clsmp":
+                    cls = torch.cat([cls, t.mean(dim=1)], dim=1)
+                embs.append(self._post(cls))
             if self.pool_to:                            # FALLBACK: g×g → pool_to×pool_to avg-pool
                 B, _P, D = t.shape
                 g = self.grid
@@ -250,7 +263,8 @@ class Dinov3Anchor(BaseAnchor):
                 x = F.adaptive_avg_pool2d(x, (self.pool_to, self.pool_to))
                 t = x.permute(0, 2, 3, 1).reshape(B, self.pool_to * self.pool_to, D)
             toks.append(t.float().cpu().numpy().astype(np.float32))
-        return {"embeds": None, "tokens": np.concatenate(toks, 0)}
+        return {"embeds": np.concatenate(embs, 0) if self.pooled else None,
+                "tokens": np.concatenate(toks, 0)}
 
 
 class RadioAnchor(BaseAnchor):
@@ -519,6 +533,7 @@ def get_anchor(cfg=None):
     if name == "dinov3":                              # C2 dense: 해상도/pool은 §2.2 결정 반영
         kwargs["force_size"] = a.get("force_size", 256)
         kwargs["pool_to"] = a.get("pool_to")          # None=native grid / 16=512→16×16 fallback
+        kwargs["pooled"] = a.get("pooled")            # dual 손목 앵커: cls|clsmp (None=dense 전용, 기존 동형)
     if name in ("dualfusion", "dualconcat"):          # 관측-레벨 융합 (cowork §3-2)
         kwargs["siglip_dir"] = a.get("siglip_dir")
         kwargs["dino_dir"] = a.get("dino_dir")

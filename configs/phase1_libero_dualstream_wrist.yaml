@@ -1,0 +1,67 @@
+# Phase 1 (LIBERO) — DUAL-STREAM 변위 AE (손목캠 = 추론 변위 스트림)
+# ══════════════════════════════════════════════════════════════════════════
+# NEW 아키텍처 (model.dual_stream=true): 카메라별 분리 앵커·인코더 2개.
+#   • anchor       (agentview) = SigLIP2-large-256 (1024-d) — 의미/전역 장면.
+#   • anchor_wrist (wrist)     = DINOv3-L/16 pooled CLS (1024-d) — 접촉/기하.
+#   g_main(a,z_main)→ζ_main≈Δz_main / g_wrist(a,z_wrist)→ζ_wrist≈Δz_wrist,
+#   h([ζ_main;ζ_wrist],[z_main_cur;z_wrist_cur])→액션청크 (DualDeltaAE).
+# dual_stream 없으면 기존 단일 스트림 경로 = 비트 동형 (train_phase1.main).
+#
+# STARTER: 메인은 단일 SigLIP2(융합 아님) — 손목-추론 효과를 깨끗이 격리.
+#   follow-up 변형: anchor=dualconcat/dualfusion(메인 융합) + anchor_wrist.
+#
+# ⚠ SCALE: anchor_wrist normalize=true (pooled CLS 단위벡터화) → Δz_wrist 스케일이
+#   Δz_main(SigLIP2 raw, normalize=false)과 다를 수 있음. align_main/align_wrist가
+#   각 스트림 독립 손실이라 학습은 안정적이나, 두 스트림 상대 스케일은 launch 전 점검 권장.
+# ⚠ CACHE: main=SigLIP2 (cache_key siglip2-so400m/joint/raw) 는 large256 캐시 재사용;
+#   wrist=DINOv3 pooled (cache_key dinov3-vitl16-256-cls/pre/norm) 는 별도 서브디렉터리
+#   → 충돌 없음 (anchor.cache_key 규약). 손목 pooled 임베딩은 신규 인코딩.
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb        # dual 손목 변위 스트림 (필수)
+  chunk_sec: 0.8                       # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256   # cache_key로 main/wrist 자동 분리
+
+anchor:                                # main (agentview) — 단일 SigLIP2 (효과 격리)
+  name: siglip2
+  model_dir: google/siglip2-large-patch16-256
+  projection: joint
+  normalize: false                     # NATIVE-BEST (large256 phase1과 동일 → 캐시 재사용)
+
+anchor_wrist:                          # wrist — DINOv3 pooled CLS (접촉/기하)
+  name: dinov3
+  model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+  pooled: cls                          # CLS pooled 임베딩 반환 (dense 전용 앵커에 pooled 활성)
+  normalize: true                      # 단위벡터화 (Δz_wrist 스케일 안정)
+
+model:
+  latent_dim: 1024                     # (참고용; dual은 앵커 dim에서 자동 도출)
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+  dual_stream: true                    # ★ dual-stream 경로 활성 (없으면 단일 = 비트 동형)
+
+loss:
+  align: 0.5                           # align_main + align_wrist 각각에 적용
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_dualstream_wrist.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_dualstream_wrist}
