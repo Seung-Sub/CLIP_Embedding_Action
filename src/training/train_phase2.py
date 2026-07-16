@@ -488,20 +488,28 @@ def main():
         # concat 융합/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)을 z 폭(2048)의 SigLIP2 서브블록에
         toks = [t if t.shape[-1] == _zd else           #   zero-pad (기존 런=no-op)
                 torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
-        zeta = model(torch.stack(toks, dim=1), generator=gen) if is_flow \
-            else model(torch.stack(toks, dim=1))
-        lat_target = ae.g(val_t[4], val_t[1])
-        ahat_t = ae.h(zeta, val_t[1])
-        if f4_on:                                     # ζ_f를 noise flow로 생성(폐루프 동형) + fine 잔차
-            zeta_f = f4.flow_sample(torch.cat(base, dim=1), generator=gen)
-            ahat_t = ahat_t + f4.fine_action(zeta, zeta_f, val_t[1])
-        ahat = ahat_t.cpu().numpy()
-    zeta_np = zeta.cpu().numpy()
-    lat_np = lat_target.cpu().numpy()
-    wm_np = (val_t[2] - val_t[1]).cpu().numpy()
-    csim = lambda a, b: float(np.mean((a*b).sum(1) /
-        (np.linalg.norm(a, axis=1)*np.linalg.norm(b, axis=1) + 1e-8)))
-    lat_cos, wm_cos = csim(zeta_np, lat_np), csim(zeta_np, wm_np)
+        if action_flow:                               # ★SWAP: ζ̂=액션청크(flatten) → ae.g/ae.h BYPASS
+            zeta = model(torch.stack(toks, dim=1), generator=gen,
+                         x0_src=Cp_va_t.reshape(len(Cp_va_t), -1))   # x0_src=val 과거 액션청크
+            ahat = zeta.reshape(len(zeta), n_chunk, act_dim).cpu().numpy()  # 액션=청크(디코딩 불요)
+        else:
+            zeta = model(torch.stack(toks, dim=1), generator=gen) if is_flow \
+                else model(torch.stack(toks, dim=1))
+            lat_target = ae.g(val_t[4], val_t[1])
+            ahat_t = ae.h(zeta, val_t[1])
+            if f4_on:                                 # ζ_f를 noise flow로 생성(폐루프 동형) + fine 잔차
+                zeta_f = f4.flow_sample(torch.cat(base, dim=1), generator=gen)
+                ahat_t = ahat_t + f4.fine_action(zeta, zeta_f, val_t[1])
+            ahat = ahat_t.cpu().numpy()
+    if action_flow:                                   # 액션공간 → 잠재 cos(g타깃/Δz타깃) N/A
+        lat_cos = wm_cos = 0.0
+    else:
+        zeta_np = zeta.cpu().numpy()
+        lat_np = lat_target.cpu().numpy()
+        wm_np = (val_t[2] - val_t[1]).cpu().numpy()
+        csim = lambda a, b: float(np.mean((a*b).sum(1) /
+            (np.linalg.norm(a, axis=1)*np.linalg.norm(b, axis=1) + 1e-8)))
+        lat_cos, wm_cos = csim(zeta_np, lat_np), csim(zeta_np, wm_np)
     Cf = Cf_va
     act_r2 = r2(Cf.reshape(len(Cf), -1), ahat.reshape(len(ahat), -1))
     # 물리 지표(MAE/그리퍼)는 시간영역으로 되돌려 계산 (repr와 무관하게 비교 가능)
