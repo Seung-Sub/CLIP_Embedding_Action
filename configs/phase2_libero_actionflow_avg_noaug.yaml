@@ -1,0 +1,65 @@
+# Phase 2 — ACTIONFLOW (flow_space=action) on Arm A (avg-fusion), NO-AUG clean regime.
+# ══════════════════════════════════════════════════════════════════════════
+# 동료 검증 설계 이식(SigLIP/, 그들의 SR 97.2). ★SWAP: 정책 flow가 잠재 ζ 대신 RAW 액션청크
+#   (n_chunk*act_dim=16*7)를 직접 수송. source=past → x0=과거 액션청크 flatten, target=미래 청크
+#   flatten. 생성 ζ̂가 곧 액션 → 동결 디코더 h BYPASS. 조건(ctx) 토큰은 그대로 잠재(언어 판별 유지).
+# actionflow는 앵커-불가지(anchor-agnostic)라 avg(우리 language-balanced arm)에서도 평가.
+# base = phase2_libero_fobsfusion_avg_noaug.yaml. phase1_ckpt = 기존 avg phase1(g 조건 인코딩만).
+# 가드: action flow는 wm(잠재 Δz)·f4(잠재 fine)·flow_refine 비호환.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_avg.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_avg   # dualfusion cache_key로 자동 분리
+
+anchor:                          # Arm A: 관측-레벨 avg-fusion (SigLIP2-L256 ⊕ DINOv3-vitl16)
+  name: dualfusion
+  projection: joint
+  normalize: true                # 공식 최종 L2norm → 출력 unit (avg판 스케일 교정)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  alpha: 0.5                     # DINO 가중 (0.5 = 외부 E3 literal mean)
+  force_size: 256                # DINOv3 256/16 = 16×16 (SigLIP2-L256 그리드 정합)
+
+module:
+  name: flow
+  flow_space: action             # ★SWAP: 액션청크 직접 flow (ζ̂=액션, ae.h bypass). 기본 latent와 유일 차이.
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true               # 조건 토큰에 lang 유지 → correct/wrong 언어 판별 경로 보존
+  wrist_token: true
+  f4:
+    enable: false                # ★action flow 필수: f4(잠재 fine 채널) 비호환 → off
+
+loss:
+  lat: 0.5                        # action mode: CFM(액션 flow-matching) 가중치
+  act: 1.0                        # 직접 L1(생성 액션청크 vs 미래 청크) — 지배 손실
+  wm: 0.0                         # ★action flow 필수: 잠재 Δz(wm)=0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_actionflow_avg_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_actionflow_avg_noaug}

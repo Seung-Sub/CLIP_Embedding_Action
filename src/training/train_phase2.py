@@ -64,6 +64,16 @@ def main():
         cfg["train"]["checkpoint"] = str(WS / f"checkpoints/grid/{args.tag}.pt")
         cfg["wandb"]["run_name"] = args.tag
     t_cfg, m_cfg, w = cfg["train"], cfg["module"], cfg["loss"]
+    # ★SWAP: action-space flow. module.flow_space='action'이면 CFM이 잠재 대신 RAW 액션청크를 직접
+    # 수송(target=cf flatten, source='past'=과거 액션청크 flatten, 생성 ζ̂가 곧 액션 → ae.h 디코딩 BYPASS).
+    # 기본 'latent'=현행 그대로(regression-0). ζ̂가 잠재가 아니라 액션이므로 잠재 Δz(wm)·f4(잠재 fine)와 비호환.
+    action_flow = (m_cfg.get("name") == "flow"
+                   and m_cfg.get("flow_space", "latent") == "action")
+    if action_flow:
+        assert float(w.get("wm", 0.0)) == 0.0, \
+            "action flow: ζ̂가 액션이라 잠재 Δz(wm) 비교 불가 → loss.wm=0 필요"
+        assert not (m_cfg.get("f4") and m_cfg["f4"].get("enable")), \
+            "action flow: f4(잠재 fine 채널)와 비호환 → module.f4.enable=false 필요"
     rng = np.random.RandomState(t_cfg["seed"])
     torch.manual_seed(t_cfg["seed"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -245,7 +255,8 @@ def main():
     # ---- 정책 모델 ----
     n_tokens = 3 + int(use_lang) + int(use_wrist) + K
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
-                                  latent_dim=p1["model"]["latent_dim"]).to(device)
+                                  latent_dim=p1["model"]["latent_dim"],
+                                  action_flat_dim=n_chunk * act_dim).to(device)
     is_flow = isinstance(model, FlowPolicy)
 
     # ---- C1/F4 fine 채널 (정책 뒤에 구성 → 정책 파라미터 RNG 소비 불변 = bit-identity) ----
@@ -260,7 +271,13 @@ def main():
                                action_dim=act_dim, n_chunk=n_chunk, n_patch=n_patch).to(device)
         print(f"f4: K={f4.K}, bottleneck={f4.bneck}, ζ_f dim={f4.zf_dim}, "
               f"dense ΔF={n_patch}×{dense_dim}, query_init=text, gate=tanh(α={float(f4.alpha):.1f})")
-    if is_flow:                                   # x0 스케일 = 잠재 타깃 분포
+    if is_flow and action_flow:                   # ★SWAP: x0 스케일 = 액션청크 타깃 분포(g 아님)
+        tgt = torch.tensor(Cf_tr[:4096], device=device).reshape(min(4096, len(Cf_tr)), -1)
+        model.x0_std.fill_(tgt.std().item())
+        print(f"[ACTION-FLOW] flow_space=action, flow_dim={model.flow_dim} "
+              f"(={n_chunk}x{act_dim}), source={model.source}, steps={model.steps}, "
+              f"x0_std(action-chunk)={model.x0_std.item():.4f}")
+    elif is_flow:                                 # x0 스케일 = 잠재 타깃 분포
         with torch.no_grad():
             lt = ae.g(torch.tensor(Cf_tr[:4096], device=device),
                       torch.tensor(Zc_tr0[:4096], device=device))
@@ -300,6 +317,8 @@ def main():
         + [torch.tensor(W_va, device=device) if use_wrist
            else torch.zeros(len(Cf_va), 0, device=device)] \
         + [torch.tensor(d, device=device) for d in Dobs_va]
+    # ★SWAP val: action flow는 x0_src=과거 액션청크 flatten 필요(val 결정화 경로). 기본 flow면 None(미사용).
+    Cp_va_t = torch.tensor(Cp_va, device=device) if action_flow else None
     epochs = 3 if args.smoke else t_cfg["epochs"]
     best_val, best_state, best_f4, patience = np.inf, None, None, 0
 
@@ -318,7 +337,7 @@ def main():
     lam_fcfm = w.get("f_cfm", 0.5)                    # C1/F4 손실 가중 (f4 off면 미사용)
     lam_consist = w.get("consist", 0.1)
 
-    def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs):
+    def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs, cp=None):
         zdim = zp.shape[-1]                           # DeltaAE 경로 폭 (dualconcat 융합=2048; 기존=앵커 폭)
         # ── S1b 역할분리: 조건 토큰 z_prev/z_cur/(wrist)는 SigLIP2 서브블록[0:cond_dim]만 사용
         #    (의미·언어 경로). g/h/ζ/wm 은 아래에서 항상 융합 z 전체(zp/zc/zn 원본) 사용.
@@ -344,6 +363,17 @@ def main():
             gen = None
             if not model.training:
                 gen = torch.Generator(device=device); gen.manual_seed(0)
+            if action_flow:
+                # ★SWAP: CFM이 RAW 액션청크를 직접 수송. target=cf flatten, x0=과거 액션청크 flatten.
+                # 생성된 ζ̂가 곧 액션청크(n_chunk*act_dim) → ae.h 디코딩 없이 직접 L1(이 분기만 non-regression-0).
+                target = cf.reshape(len(cf), -1)
+                x0_src = cp.reshape(len(cp), -1)
+                zeta, l_fm = model.fm_and_sample(toks, target, generator=gen,
+                                                 x0_src=x0_src)
+                ahat_rep = zeta.reshape(len(zeta), n_chunk, act_dim)  # 생성 액션 = 청크 (디코딩 불요)
+                l_act = torch.nn.functional.l1_loss(ahat_rep, cf)
+                total = w["lat"] * l_fm + w["act"] * l_act         # wm=0 강제(가드), f4 off(가드)
+                return total, {"lat": l_fm.item(), "act": l_act.item(), "wm": 0.0}
             with torch.no_grad():
                 lat_target = ae.g(cf, zc)
             zeta, l_fm = model.fm_and_sample(toks, lat_target, generator=gen)   # ζ̂_g (정책 무변경)
@@ -382,7 +412,8 @@ def main():
             cp = cp + torch.randn_like(cp) * past_noise
         with torch.no_grad():
             aemb = ae.g(cp, zp)
-        return forward(zp, zc, zn, aemb, cf, lang, wr, *dobs)
+        # cp(과거 액션청크)는 action flow의 x0_src로 필요(그 외 forward가 무시 → regression-0).
+        return forward(zp, zc, zn, aemb, cf, lang, wr, *dobs, cp=cp)
 
     t0 = time.time()
     for ep in range(epochs):
@@ -405,7 +436,7 @@ def main():
         if f4_on:
             f4.eval()
         with torch.no_grad():
-            val_loss, val_parts = forward(*val_t)
+            val_loss, val_parts = forward(*val_t, cp=Cp_va_t)
         val_loss = val_loss.item()
         if val_loss < best_val - 1e-5:
             best_val, patience = val_loss, 0

@@ -93,7 +93,8 @@ def load_models(cfg, device):
 
     policy = build_policy_from_cfg(
         m, n_tokens=3 + int(use_lang) + int(use_wrist) + K,
-        latent_dim=p1["model"]["latent_dim"]).to(device).eval()
+        latent_dim=p1["model"]["latent_dim"],
+        action_flat_dim=ck1["n_chunk"] * ck1["action_dim"]).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
     wrist_cam = ck2["config"]["data"].get("wrist_camera") if use_wrist else None
 

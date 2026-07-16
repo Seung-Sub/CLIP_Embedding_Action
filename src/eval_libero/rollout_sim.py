@@ -73,6 +73,10 @@ def main():
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion, f4) = load_models(cfg, device)
     is_hflow = getattr(ae, "h_mode", "mlp") == "flow"   # h가 flow 디코더면 generator 전달 가능
+    af = getattr(policy, "flow_space", "latent") == "action"   # ★SWAP: 정책 출력이 곧 액션 → ae.h BYPASS
+    if af:
+        print("[ACTION-FLOW] policy.flow_space=action — ζ̂=액션청크 직접 사용(ae.h 디코딩 bypass), "
+              "x0_src=과거 액션청크", flush=True)
     ds = LiberoDataset(cfg)          # span/resample 재사용
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     # S1b 역할분리(cond_anchor): 조건 토큰=SigLIP2 서브블록[0:cond_dim] / g·h·ζ=융합 z 전체.
@@ -196,16 +200,25 @@ def main():
                     # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)
                     toks = [t if t.shape[-1] == _zd else
                             torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
-                    zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
-                    if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
-                        zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
-                    ahat_lat = ae.h(zeta, zc, generator=ep_gen) if is_hflow \
-                        else ae.h(zeta, zc)              # frozen h(ζ_g, z_cur); flow면 에피소드 고정노이즈
-                    if f4 is not None:                   # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
-                        ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
-                    ahat = chunkrep.from_repr(
-                        ahat_lat.cpu().numpy()[0], repr_kind) \
-                        * a_std + a_mean
+                    if af:   # ★SWAP: action-space flow. x0_src=과거 정규화 액션청크 flatten(=a_emb에 먹인
+                             # `past`, train_phase2 cp.reshape(len,-1) 동형). 정책 출력 ζ̂가 곧 액션청크
+                             # (n_chunk*act_dim) → ae.h 디코딩 없이 reshape(n_chunk,act_dim)→from_repr→invert.
+                        x0_src_t = torch.tensor(past.reshape(1, -1), device=device)
+                        zeta = policy(torch.stack(toks, dim=1), x0_src=x0_src_t)
+                        ahat = chunkrep.from_repr(
+                            zeta.detach().cpu().numpy()[0].reshape(n_chunk, act_dim),
+                            repr_kind) * a_std + a_mean
+                    else:    # 잠재 flow(그 외 전 config): 원본 경로 그대로(regression-0)
+                        zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
+                        if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
+                            zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
+                        ahat_lat = ae.h(zeta, zc, generator=ep_gen) if is_hflow \
+                            else ae.h(zeta, zc)          # frozen h(ζ_g, z_cur); flow면 에피소드 고정노이즈
+                        if f4 is not None:               # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
+                            ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
+                        ahat = chunkrep.from_repr(
+                            ahat_lat.cpu().numpy()[0], repr_kind) \
+                            * a_std + a_mean
                     ahat = np.clip(ahat, -1.0, 1.0)
                     infer_ms.append((time.time() - t0) * 1000)
                     for k in range(min(H, args.max_steps - t)):
