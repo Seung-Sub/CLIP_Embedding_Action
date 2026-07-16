@@ -144,3 +144,20 @@
 
 → **통합 결론**: **"어디에 넣느냐(관측 본류)"가 값이고, 디코더/코드-측 복잡화(flow-decode 계열)·타깃-측 게이트(C1/C2)·역할분리(S1b)·패치-관측(F3/grid-token)는 무익.** best base = **concat 97.5 / avg 91.5(언어균형)**. 남은 cheap 개선 = center-crop. 이 단순성 자체가 "frozen 변위 접지"의 강한 서사(복잡한 시각융합보다 삽입점·전처리가 결정).
 - **ops 노트**: dense-patch 인코딩(grid-token)·동시 롤아웃서 proc-death+zombie GPU 반복 → HF_HUB_OFFLINE 기본화 + watchdog docker restart로 대응(데이터 무손실).
+
+## 11. Phase-B — wrist-cam 추론(dual-stream 변위) (2026-07-16)
+목표(사용자 요청): wrist-cam을 단순 조건입력이 아닌 **추론(변위) 스트림**으로 승격, **카메라별 특성에 맞게 인코더 분리**. best base 확정(Phase-A) 후 적용.
+
+**설계**: `DualDeltaAE` — main(agentview)=SigLIP2-large256 전역, wrist=DINOv3-CLS(별도 인코더). g_main·g_wrist 분리 → 각 스트림 독립 변위 ζ 추론, 확장 h가 [ζ_main;ζ_wrist]에서 액션 디코드. 독립 align loss(main/wrist). isolation base(main=단일 SigLIP2, 융합 아님)로 **wrist-추론 효과만 격리**(천장 없는 헤드룸에서 검정). wrist 인코더는 grid-token OOM 전례 때문에 dense-patch 대신 CLS 채택.
+
+**결과**:
+| 항목 | 값 | 판정 |
+|---|---|---|
+| phase1/phase2 offline | act R² **+0.663**, align_main·align_wrist **둘 다 수렴** | ✅ 모델·dual경로 정상, 스케일 불균형이 학습 안 깨뜨림 |
+| closed-loop SR (correct, 부분×3) | **66.7% / 76.2% / 80.6%** | ❌ large256-single baseline **85-88 하회 = uplift 없음** |
+
+→ **판정**: **wrist-추론(dual-stream 변위)은 closed-loop 이득 없음.** offline은 건강하나(변위가 잘 학습·정렬됨) 폐루프 성공률은 baseline 이하 → wrist를 추론 스트림으로 승격해도 정책이 이득 못 얻음. **Phase-A의 "복잡화 무익, 단순 관측융합 승자" 패턴과 완전 정합** (h-flow/actionflow/residual-flow/grid-token에 이어 dual-stream도 음성). wrist는 현행 **조건입력**이 최선.
+- **⚠ 한계(정직)**: 롤아웃이 이 박스에서 **CAP4/2/1 모두 27-84ep서 proc-death**(osmesa/mujoco per-process 렌더링 누수 추정) → full-400 완주 불가, 3회 부분판독. 매칭 large256-single phase2 ckpt 부재로 동일-task 동시대조는 미수행. 단 3회 부분 모두 66-81%로 baseline을 넘지 못해 **"이득 없음" 결론은 방향상 견고**(uplift였다면 88+ 방향이어야). 정밀 수치는 롤아웃 안정화 후 재검 가능.
+
+## 통합 서사 (Phase-A + Phase-B 종합)
+전체 계획(아키텍처 서치 → wrist) 완주. **모든 축에서 동일 결론**: frozen VL-잠재 변위 접지의 값은 **단순 관측-레벨 융합(concat/avg)의 삽입점 + 전처리**에 있고, 디코더/코드-측/역할분리/패치-관측/추가-변위-스트림(wrist) 등 **아키텍처 복잡화는 폐루프에서 일관되게 무익**. 이 강건한 단순성이 프레임워크의 핵심 서사.
