@@ -20,6 +20,34 @@ import torch
 from core.config import load_config
 
 
+def _crop224(pil_images):
+    """P-A center-crop 전처리 (DESIGN_pipeline_rethink §4.2(1)·§8 P-A).
+
+    콜리그-EXACT 기하 규약 = facebook/dinov2-large 기본 AutoImageProcessor
+    (BitImageProcessor — _Dinov2FusionBranch 1차 arm / Dinov2Anchor center_crop=True
+    판이 쓰는 바로 그 경로)의 기하 연산부 verbatim 미러:
+      resize(shortest_edge=256, resample=BICUBIC, int-내림 aspect 유지)
+      → center_crop(224×224, offset=(h−224)//2 / (w−224)//2).
+    이후 각 앵커의 native processor 가 model 해상도로 재-resize (crop → native resize).
+    LIBERO 256×256 렌더: resize no-op → 테두리 12.5% 삭제(작업공간 중앙 확대)
+    = 격리 실증 +~5pp 레버 (DINOv2-avg@crop 96.0 vs matched no-crop 90.5, §8).
+    """
+    from PIL import Image
+    out = []
+    for im in pil_images:
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        w, h = im.size
+        if min(w, h) != 256:                       # HF get_size_with_aspect_ratio 미러
+            short, long_ = (w, h) if w <= h else (h, w)
+            new_long = int(256 * long_ / short)    # int-내림 (HF 동일)
+            w, h = (256, new_long) if w <= h else (new_long, 256)
+            im = im.resize((w, h), Image.BICUBIC)
+        left, top = (w - 224) // 2, (h - 224) // 2   # HF center_crop 오프셋 규약
+        out.append(im.crop((left, top, left + 224, top + 224)))
+    return out
+
+
 class BaseAnchor:
     id = "base"
     dim = None
@@ -93,10 +121,15 @@ class Siglip2Anchor(BaseAnchor):
     has_text = True
     patch_dim = 1152
 
-    def __init__(self, projection="joint", normalize=True, model_dir=None):
+    def __init__(self, projection="joint", normalize=True, model_dir=None, crop=False):
         if projection != "joint":
             raise ValueError("siglip2: projection=pre 미지원 (공유 공간 헤드 일체형)")
         super().__init__(projection, normalize)
+        # P-A crop arm: encode 직전 콜리그-EXACT 224 center-crop (텍스트 경로 무관).
+        # 인스턴스 id 접미사가 클래스 id 를 가림 → 캐시 키 완전 분리 (no-crop 캐시 불오염).
+        self.crop = bool(crop)
+        if self.crop:
+            self.id = self.id + "-crop224"
         from transformers import AutoModel, AutoProcessor
         src = model_dir or "google/siglip2-so400m-patch14-384"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -115,6 +148,8 @@ class Siglip2Anchor(BaseAnchor):
 
     @torch.no_grad()
     def encode_images(self, pil_images):
+        if self.crop:                              # P-A: crop → native resize 순서
+            pil_images = _crop224(list(pil_images))
         inputs = self.processor(images=pil_images, return_tensors="pt").to(self.device)
         px = inputs["pixel_values"].to(self.model.dtype)
         emb = self._tensor(self.model.get_image_features(pixel_values=px))
@@ -206,7 +241,7 @@ class Dinov3Anchor(BaseAnchor):
     patch_dim = 1024
 
     def __init__(self, projection="pre", normalize=False, model_dir=None,
-                 force_size=256, pool_to=None, pooled=None):
+                 force_size=256, pool_to=None, pooled=None, crop=False):
         super().__init__("pre", normalize)             # joint 공간 없음 → pre 고정
         from transformers import AutoImageProcessor, AutoModel
         src = model_dir or "facebook/dinov3-vitl16-pretrain-lvd1689m"
@@ -241,10 +276,17 @@ class Dinov3Anchor(BaseAnchor):
         if pooled:
             self.id += f"-{pooled}"                    # 별도 pooled 캐시 키 (dense와 분리)
             self.dim = self.model.config.hidden_size * (2 if pooled == "clsmp" else 1)
+        # P-A crop arm: encode 직전 콜리그-EXACT 224 center-crop 후 native resize.
+        # crop=False(기본) = 기존 no-crop 전체프레임 경로 비트 동형. id 접미사 = 캐시 분리.
+        self.crop = bool(crop)
+        if self.crop:
+            self.id += "-crop224"
 
     @torch.no_grad()
     def encode_images(self, pil_images):
         import torch.nn.functional as F
+        if self.crop:                                  # P-A: crop → native resize 순서
+            pil_images = _crop224(list(pil_images))
         toks, embs = [], []
         for i in range(0, len(pil_images), 16):        # OOM 안전 서브배치 (512 fp32)
             inp = self.processor(images=pil_images[i:i + 16], return_tensors="pt",
@@ -404,15 +446,22 @@ class DualFusionAnchor(BaseAnchor):
     patch_dim = None                                 # pooled-only fusion (dense 미노출)
 
     def __init__(self, projection="joint", normalize=True, model_dir=None,
-                 siglip_dir=None, dino_dir=None, alpha=0.5, force_size=256):
+                 siglip_dir=None, dino_dir=None, alpha=0.5, force_size=256,
+                 crop="none"):
         if projection != "joint":
             raise ValueError("dualfusion: projection=pre 미지원 (SigLIP2 공유공간 위임)")
         super().__init__("joint", normalize)
         self.alpha = float(alpha)
+        # P-A crop arm (§8): none(기본, 기존 비트 동형) / dino(DINO 브랜치만) / both(양 브랜치).
+        #   sig 브랜치 crop 은 Siglip2Anchor 내부에서, dino 브랜치 crop 은 _dino_pooled 에서
+        #   (브랜치 processor 를 직접 호출하는 경로라 융합측이 담당) 적용.
+        assert crop in ("none", "dino", "both"), crop
+        self.crop = crop
         # sig 브랜치는 normalize=True 고정 (공식의 L2norm(sig_pooled) — 외부 SiglipWrapper 동형).
         self._sig = Siglip2Anchor(projection="joint", normalize=True,
                                   model_dir=siglip_dir or model_dir
-                                  or "google/siglip2-large-patch16-256")
+                                  or "google/siglip2-large-patch16-256",
+                                  crop=(crop == "both"))
         # 백본 선택 = dino_dir. "dinov2" 포함 → DINOv2 콜리그 판, 그 외 → 기존 DINOv3(불변).
         dino_dir = dino_dir or "facebook/dinov3-vitl16-pretrain-lvd1689m"
         self._is_dinov2 = "dinov2" in dino_dir.lower()
@@ -425,6 +474,11 @@ class DualFusionAnchor(BaseAnchor):
             self._dino = Dinov3Anchor(projection="pre", normalize=False,
                                       model_dir=dino_dir, force_size=force_size)
             dino_tag = f"dinov3_{self._dino.force_size}"     # 기존과 동일 (256)
+        # DINOv2 콜리그-기본 arm(force_size=None)은 processor 가 이미 256→224 center-crop
+        # → crop 옵션과 결합하면 이중 crop (침묵 오염) → loud fail.
+        if self.crop != "none" and self._is_dinov2 and self._dino.force_size is None:
+            raise ValueError("crop: dinov2 콜리그-기본 arm 은 processor 가 이미 center-crop "
+                             "— 이중 crop 금지 (force_size 지정 또는 crop: none)")
         self.device = self._sig.device
         assert self._sig.dim == self._dino.dim, \
             f"dualfusion: SigLIP dim {self._sig.dim} != DINO dim {self._dino.dim}"
@@ -433,6 +487,8 @@ class DualFusionAnchor(BaseAnchor):
         # id 는 백본판별 접미사로 분기 → dinov2/dinov3 캐시 완전 분리.
         # DINOv3(dinov3_256)는 기존 문자열과 byte-identical.
         self.id = f"dualfusion-sig{self._sig.dim}-{dino_tag}-a{self.alpha}"
+        if self.crop != "none":
+            self.id += f"-crop224{self.crop}"         # P-A: crop arm 별 캐시 키 완전 분리
 
     def _dino_pooled(self, pil_images):
         """DINO pooled global (외부 dual_wrapper 의 dino.pooler_output 대응).
@@ -441,7 +497,10 @@ class DualFusionAnchor(BaseAnchor):
         (Dinov2Anchor 주석 = HF 검증: DINO pooler == last_hidden[:,0]).
         DINOv3(fp32) 서브배치는 Dinov3Anchor.encode_images 규약 미러 — size=_size 항상 전달.
         DINOv2 1차 arm(_size=None)은 size 인자 미전달 = 콜리그 dual_wrapper.py:62 EXACT.
+        P-A crop(dino|both): 브랜치 native 전처리 직전 콜리그-EXACT 224 center-crop.
         """
+        if self.crop in ("dino", "both"):
+            pil_images = _crop224(list(pil_images))
         d = self._dino
         outs = []
         for i in range(0, len(pil_images), 16):       # fp32 OOM 안전 서브배치
@@ -487,15 +546,18 @@ class DualConcatAnchor(DualFusionAnchor):
     patch_dim = None
 
     def __init__(self, projection="joint", normalize=False, model_dir=None,
-                 siglip_dir=None, dino_dir=None, force_size=256):
+                 siglip_dir=None, dino_dir=None, force_size=256, crop="none"):
         super().__init__(projection=projection, normalize=normalize,
                          model_dir=model_dir, siglip_dir=siglip_dir,
-                         dino_dir=dino_dir, alpha=0.5, force_size=force_size)
+                         dino_dir=dino_dir, alpha=0.5, force_size=force_size,
+                         crop=crop)
         self.dim = self._sig.dim + self._dino.dim     # 1024 + 1024 = 2048
         self.dim_text = self._sig.dim_text            # SigLIP2 서브블록 = 1024
         # id 백본판별 분기 (DualFusionAnchor 와 동형) — dinov3_256 은 기존과 byte-identical.
         dino_tag = self._dino._id if self._is_dinov2 else f"dinov3_{self._dino.force_size}"
         self.id = f"dualconcat-sig{self._sig.dim}-{dino_tag}"
+        if self.crop != "none":                       # P-A: id 재구성 후 crop 접미사 재부착
+            self.id += f"-crop224{self.crop}"
 
     @torch.no_grad()
     def encode_images(self, pil_images):
@@ -525,8 +587,18 @@ def get_anchor(cfg=None):
     _raw = name in ("dinov3", "dualconcat")           # concat = 서브블록 unit, 전역 재정규화 안 함
     kwargs = {"projection": a.get("projection", "pre" if _pre else "joint"),
               "normalize": a.get("normalize", False if _raw else True)}
+    # P-A crop arm (§4.2(1)/§8): none(기본=기존 비트 동형) | dino | both.
+    #   융합 앵커: dino=DINO 브랜치만 / both=양 브랜치. 단독 앵커 해석은 동일 의미론 —
+    #   siglip2 는 both 일 때만, dinov3 는 dino|both 에서 crop (dino=DINO 브랜치 전용 의미).
+    _crop = a.get("crop", "none")
+    if _crop not in ("none", "dino", "both"):
+        raise ValueError(f"anchor.crop {_crop!r} (지원: none|dino|both)")
+    if _crop != "none" and name not in ("siglip2", "dinov3", "dualfusion", "dualconcat"):
+        raise ValueError(f"anchor.crop 은 siglip2/dinov3/dualfusion/dualconcat 전용 ({name})")
     if name == "clip":
         return ClipAnchor(**kwargs, cfg=cfg)
+    if name == "siglip2":
+        kwargs["crop"] = _crop == "both"
     if name == "dinov2":
         kwargs["pooled"] = a.get("pooled", "cls")
         kwargs["center_crop"] = a.get("center_crop", False)   # 기본 = no-crop (v2 보정)
@@ -534,10 +606,12 @@ def get_anchor(cfg=None):
         kwargs["force_size"] = a.get("force_size", 256)
         kwargs["pool_to"] = a.get("pool_to")          # None=native grid / 16=512→16×16 fallback
         kwargs["pooled"] = a.get("pooled")            # dual 손목 앵커: cls|clsmp (None=dense 전용, 기존 동형)
+        kwargs["crop"] = _crop in ("dino", "both")
     if name in ("dualfusion", "dualconcat"):          # 관측-레벨 융합 (cowork §3-2)
         kwargs["siglip_dir"] = a.get("siglip_dir")
         kwargs["dino_dir"] = a.get("dino_dir")
         kwargs["force_size"] = a.get("force_size", 256)
+        kwargs["crop"] = _crop
         if name == "dualfusion":
             kwargs["alpha"] = a.get("alpha", 0.5)
     return _REGISTRY[name](**kwargs, model_dir=a.get("model_dir"))

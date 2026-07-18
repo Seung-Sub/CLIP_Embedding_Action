@@ -1,0 +1,53 @@
+# Phase 1 (LIBERO) — P-A CROP-AVG arm 1: avg 융합 + DINO 브랜치만 center-crop (사전등록 §8 P-A).
+# ══════════════════════════════════════════════════════════════════════════
+# phase1_libero_fobsfusion_avg.yaml 미러링 + anchor.crop: dino 한 줄 추가.
+#   crop = 콜리그-EXACT 224 center-crop(shortest_edge 256 resize→224 crop) 후 native resize —
+#   격리 실증 +~5pp 레버 (DINOv2-avg@crop 96.0 vs matched no-crop 90.5, DESIGN_pipeline_rethink §4.2(1)).
+#   arm 1 = DINO 브랜치만 crop (SigLIP2 브랜치는 기존 no-crop 유지 — 언어정렬 성분 보수적 보존).
+# cache_key = dualfusion-sig1024-dinov3_256-a0.5-crop224dino → no-crop 캐시와 완전 분리 (오염 불가).
+# 이 체크포인트가 phase2_libero_cropavg_dino_noaug.yaml 의 phase1_ckpt.
+#   실행:  python src/training/train_phase1.py --config configs/phase1_libero_cropavg_dino.yaml
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_cropavg   # crop arm 별 cache_key 하위디렉터리 자동 분리
+
+anchor:
+  name: dualfusion
+  projection: joint
+  normalize: true                # 공식 최종 L2norm → 출력 unit
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  alpha: 0.5
+  force_size: 256
+  crop: dino                     # ★P-A arm 1: DINO 브랜치만 콜리그-EXACT 224 center-crop
+
+model:
+  latent_dim: 768              # train_phase1.py:92-93가 anchor.dim(1024)으로 자동 덮어씀
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_cropavg_dino.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_cropavg_dino}

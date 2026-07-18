@@ -1,0 +1,64 @@
+# Phase 2 — P-A CROP-CONCAT 자매팔 (concat 융합 + DINO 브랜치 crop), NO-AUG clean regime (§8 P-A).
+# ══════════════════════════════════════════════════════════════════════════
+# phase2_libero_fobsfusion_concat_noaug.yaml (SR-max 트랙 winner 계열) 미러링 — 유일 차이 =
+#   anchor.crop: dino + phase1_ckpt/cache/체크포인트 경로. lang 토큰은 fobsfusion_concat 과 동일하게
+#   SigLIP2 서브블록[0:1024] zero-pad 훅 (train_phase2.py, 학습 파라미터 0)이 처리.
+# 대조군 = phase2_libero_fobsfusion_concat_noaug.pt (concat no-crop). 게이트: G-off dec R²≥0.72
+#   → G-cl (avg 기준선 91.5 및 concat no-crop 대비 paired CI) → G-lang correct−wrong ≥+70pp.
+# phase1_ckpt = crop-dino concat z 로 DeltaAE 재적합한 phase1_libero_cropconcat_dino.pt (선행 학습 필요).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_cropconcat_dino.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_cropconcat   # phase1 과 동일 루트, cache_key 로 arm 분리
+
+anchor:                          # P-A 자매팔: no-mix concat + DINO 브랜치만 224 center-crop
+  name: dualconcat
+  projection: joint
+  normalize: false               # ★concat 전역 재정규화 안 함 (서브블록 각각 unit = no-mix 취지)
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+  crop: dino                     # ★phase1_libero_cropconcat_dino.yaml 과 반드시 동일 (캐시/z 공간 일치)
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false                # ★pooled-only 융합: fine 채널 없음 (no-aug baseline과 동일)
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_cropconcat_dino_noaug.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_cropconcat_dino_noaug}
