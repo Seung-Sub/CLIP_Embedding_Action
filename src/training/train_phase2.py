@@ -405,6 +405,14 @@ def main():
     grid_cfg = m_cfg.get("grid_obs")
     grid_anchor = None
     if grid_cfg:
+        # ── VERIFY A1: 미지원 키 loud-fail. grid_cfg 는 아래에서 .get()으로만 소비되므로
+        #    오타/미배선 키(예 ln/tok_drop 철자 오류)는 에러 없이 무음 무시된다 —
+        #    규격 미달 팔이 규격 팔로 학습·보고되는 최악 경로를 여기서 차단.
+        _GRID_KEYS = {"anchor", "camera", "n_tokens", "pool", "d_attn", "heads",
+                      "ln", "tok_drop", "group_drop", "init_std"}
+        _unk = set(grid_cfg) - _GRID_KEYS
+        assert not _unk, (f"grid_obs: 미지원 키 {sorted(_unk)} — "
+                          f"허용 키 = {sorted(_GRID_KEYS)} (VERIFY A1: silent no-op 금지)")
         assert m_cfg.get("name") == "flow", "grid_obs: flow 정책 전제(조건 토큰 삽입)"
         assert not m_cfg.get("obs"), "grid_obs 와 module.obs 는 동시 사용 불가"
         assert not (m_cfg.get("f4") and m_cfg["f4"].get("enable")), \
@@ -529,11 +537,19 @@ def main():
                            n_tokens=grid_cfg.get("n_tokens", 16),
                            pool=grid_cfg.get("pool", "avg"),
                            d_attn=grid_cfg.get("d_attn", 768),
-                           heads=grid_cfg.get("heads", 8)).to(device)
+                           heads=grid_cfg.get("heads", 8),
+                           # W-A(N1) guarded 옵션 — 기본 off = 기존 config 비트 동형 (VERIFY A1)
+                           ln=grid_cfg.get("ln", False),
+                           tok_drop=grid_cfg.get("tok_drop", 0.0),
+                           group_drop=grid_cfg.get("group_drop", 0.0),
+                           init_std=grid_cfg.get("init_std")).to(device)
         Kg = grid_obs.n_tokens
         print(f"grid_obs: pool={grid_obs.pool}, K={Kg} tokens ({grid_obs.g_out}×"
               f"{grid_obs.g_out} grid), patch {Dobs_tr[0].shape[-2]}×{gp_dim}→"
               f"latent {p1['model']['latent_dim']}, UNGATED, "
+              f"ln={grid_obs.in_ln is not None}, tok_drop={grid_obs.tok_drop}, "
+              f"group_drop={grid_obs.group_drop}, "
+              f"init_std={grid_cfg.get('init_std')}, "
               f"params {sum(p.numel() for p in grid_obs.parameters())/1e6:.3f}M")
 
     # ---- 정책 모델 ----

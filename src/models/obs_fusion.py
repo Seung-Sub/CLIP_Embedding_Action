@@ -102,9 +102,20 @@ class GridObs(nn.Module):
       'avg' / '2x2' : adaptive_avg_pool2d(g×g → g_out×g_out) — 파라미터-0 공간 다운샘플.
                       출력 격자는 n_tokens 로 결정(g_out=round(√n_tokens); 기본 16 → 4×4).
       'attn'        : K개 학습쿼리 × cross-attn(학습형 풀; ObsFusion.attn 단일앵커판 — ablation용).
+
+    W-A(WristCond-v1) guarded 옵션 (DESIGN_wrist_fusion_unified_v1 §2.3 N1 · VERIFY A1;
+    기본값은 전부 off = 기존 config 비트/바이트 동형 — 모듈 생성·RNG 소비·state_dict 키 불변):
+      ln=True       : 사영(proj) **앞** LayerNorm(patch_dim) — N1, F3 kv-LN 결함의 param-최소 대응.
+                      attn 풀에선 kv_proj 앞에 적용. False(기본)면 서브모듈 자체를 만들지 않음.
+      tok_drop      : 학습시만, 사영 후 토큰별 독립 zero-drop p (rescale 없음 — zero-ablation 동형).
+      group_drop    : 학습시만, K개 그리드 토큰 **전부를 함께** 0으로 (패치 문서 §2.3 ②:
+                      "기하 토큰 없이도 동작하는 언어-only 경로" 유지 강제 — modality-dropout 관례).
+      init_std      : proj weight 를 N(0, init_std²)·bias 0 으로 재초기화 (설계 규격 0.02).
+                      None(기본)이면 torch 기본 init 그대로 (RNG 스트림 불변).
     """
     def __init__(self, patch_dim, out_dim, n_tokens=16, pool="avg",
-                 d_attn=768, heads=8):
+                 d_attn=768, heads=8, ln=False, tok_drop=0.0, group_drop=0.0,
+                 init_std=None):
         super().__init__()
         assert pool in ("avg", "2x2", "attn"), pool
         self.pool = "avg" if pool in ("avg", "2x2") else "attn"
@@ -113,6 +124,12 @@ class GridObs(nn.Module):
         assert self.g_out * self.g_out == self.n_tokens, \
             f"n_tokens={n_tokens} 는 공간 격자용 완전제곱이어야 함 (예 16→4×4)"
         self.out_dim = out_dim
+        self.tok_drop = float(tok_drop)
+        self.group_drop = float(group_drop)
+        assert 0.0 <= self.tok_drop < 1.0 and 0.0 <= self.group_drop < 1.0, \
+            (tok_drop, group_drop)
+        # ln=False(기본)면 미생성 → 기존 ckpt 와 state_dict 키 동일 (byte-identity)
+        self.in_ln = nn.LayerNorm(patch_dim) if ln else None
         if self.pool == "avg":
             self.proj = nn.Linear(patch_dim, out_dim)          # 학습 파라미터 = 사영 1개
         else:
@@ -121,6 +138,21 @@ class GridObs(nn.Module):
             self.query = nn.Parameter(torch.randn(n_tokens, d_attn))
             self.attn = nn.MultiheadAttention(d_attn, heads, batch_first=True)
             self.proj = nn.Linear(d_attn, out_dim)
+        if init_std is not None:                               # 설계 규격 std 0.02 (guarded)
+            nn.init.normal_(self.proj.weight, std=float(init_std))
+            nn.init.zeros_(self.proj.bias)
+
+    def _drop(self, x):                                    # (B, K, out_dim) — 학습시만 활성
+        if not self.training or (self.tok_drop <= 0 and self.group_drop <= 0):
+            return x                                       # eval/off = 항등 (비트 동형)
+        B = x.shape[0]
+        if self.tok_drop > 0:                              # ① per-token zero-drop (독립)
+            keep = (torch.rand(B, self.n_tokens, 1, device=x.device) >= self.tok_drop)
+            x = x * keep.to(x.dtype)
+        if self.group_drop > 0:                            # ② group-drop: K개 전부 0 (언어-only 경로)
+            keep = (torch.rand(B, 1, 1, device=x.device) >= self.group_drop)
+            x = x * keep.to(x.dtype)
+        return x
 
     def forward(self, patches):                            # (B, P=g×g, patch_dim)
         import torch.nn.functional as F
@@ -131,8 +163,11 @@ class GridObs(nn.Module):
             x = patches.reshape(B, g, g, D).permute(0, 3, 1, 2)          # (B,D,g,g)
             x = F.adaptive_avg_pool2d(x, (self.g_out, self.g_out))       # (B,D,go,go)
             x = x.permute(0, 2, 3, 1).reshape(B, self.n_tokens, D)       # (B,K,D)
-            return self.proj(x)                                          # (B,K,out_dim)
+            if self.in_ln is not None:                                   # N1: 사영 전 LN(patch_dim)
+                x = self.in_ln(x)
+            return self._drop(self.proj(x))                              # (B,K,out_dim)
         q = self.query.unsqueeze(0).expand(B, -1, -1)                    # (B,K,d_attn)
-        kv = self.ln(self.kv_proj(patches))
+        kv = patches if self.in_ln is None else self.in_ln(patches)      # N1 (attn 판: kv_proj 앞)
+        kv = self.ln(self.kv_proj(kv))
         o, _ = self.attn(q, kv, kv)
-        return self.proj(o)                                              # (B,K,out_dim)
+        return self._drop(self.proj(o))                                  # (B,K,out_dim)

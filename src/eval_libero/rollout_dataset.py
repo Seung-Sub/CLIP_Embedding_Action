@@ -111,7 +111,13 @@ def load_models(cfg, device):
                            n_tokens=grid_cfg.get("n_tokens", 16),
                            pool=grid_cfg.get("pool", "avg"),
                            d_attn=grid_cfg.get("d_attn", 768),
-                           heads=grid_cfg.get("heads", 8))
+                           heads=grid_cfg.get("heads", 8),
+                           # W-A(N1) guarded 옵션 미러 (VERIFY A1) — ln 은 state_dict 키에
+                           # 필요, tok/group_drop 은 eval()에서 비활성, init_std 는 로드로 덮임.
+                           ln=grid_cfg.get("ln", False),
+                           tok_drop=grid_cfg.get("tok_drop", 0.0),
+                           group_drop=grid_cfg.get("group_drop", 0.0),
+                           init_std=grid_cfg.get("init_std"))
         grid_obs.load_state_dict(ck2["grid_obs"])
         grid_obs = grid_obs.to(device).eval()
         Kg = grid_obs.n_tokens
