@@ -200,9 +200,13 @@ def sample_zeta(policy, f4, tokens, generator=None):
     수치적으로 동일하며, 학습부(train_phase2)의 순차 2-루프와도 전송의미 동등.
 
     f4 is None 이면 policy 단독 샘플(policy.forward)과 완전히 동일한 호출 → 비트 동형.
+    generator: rollout --flow-noise-mode locked 전용 주입(정책 x0·ζ_f 노이즈 잠금).
+    None(기본)이면 종전과 동일하게 전역 RNG 사용 — 기존 호출부 비트 동형.
     """
     if f4 is None:
-        return policy(tokens), None                     # 현행 호출과 동일 = 비트 동형
+        if generator is None:
+            return policy(tokens), None                 # 현행 호출과 동일 = 비트 동형
+        return policy(tokens, generator=generator), None  # locked: FlowPolicy에만 전달
     assert policy.steps == f4.flow_steps, (
         f"shared-τ 요구: policy.steps({policy.steps}) == "
         f"f4.flow_steps({f4.flow_steps})")

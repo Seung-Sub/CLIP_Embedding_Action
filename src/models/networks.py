@@ -134,7 +134,7 @@ class ResidualFlowDecoder(nn.Module):
       res.x0_std = **잔차** std(액션 std 아님, train_phase1이 주입) → 평균 주위 소분산.
     forward(z,z_t[,generator])는 ChunkDecoder/ChunkFlowDecoder와 동일 인터페이스
     (샘플 반환)라 phase2/rollout의 ae.h(ζ,z_cur)[,generator] 무변경 호환.
-    generator는 잔차 flow x0 노이즈 재현(rollout --flow-fixed-noise 안정화)용."""
+    generator는 잔차 flow x0 노이즈 재현(rollout --flow-noise-mode walk/locked 안정화)용."""
 
     def __init__(self, action_dim, n_chunk, latent_dim=768, hidden=512,
                  layers=4, dropout=0.0, state_cond=True, steps=5):

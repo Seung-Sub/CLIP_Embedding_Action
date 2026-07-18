@@ -19,8 +19,10 @@ sys.path.insert(0, str(WS / "src"))
 
 import argparse
 import collections
+import json
 import os
 import time
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -57,11 +59,26 @@ def main():
                     help="병목-효능 프로브(C1 게이트): f4 로드 시 fine 채널 ζ_f 기여를 0으로 "
                          "만들어 pooled(ζ_g)만으로 롤아웃. 미지정 시 현행과 비트 동형. "
                          "SR(full C1) vs SR(--ablate-zf) 로 ζ_f 기여 확인.")
+    ap.add_argument("--flow-noise-mode", choices=["fresh", "walk", "locked"],
+                    default="fresh",
+                    help="flow 샘플 x0 노이즈 정책: fresh=재계획마다 독립 샘플(기본, 기존과 비트 동형) / "
+                         "walk=에피소드당 1회 시딩 후 생성기가 호출마다 전진(구 --flow-fixed-noise; "
+                         "재계획 간 결정론적이지만 x0는 매 재계획 달라지는 '결정론적 워크') / "
+                         "locked=매 샘플 호출 직전 에피소드 시드로 재시딩 → 에피소드 내 모든 재계획에서 "
+                         "x0 동일(진짜 mode-lock; mode-switching 배회 방지는 이 모드가 검증 대상)")
     ap.add_argument("--flow-fixed-noise", action="store_true", default=False,
-                    help="h_mode=flow/residual_flow 전용: 에피소드당 x0 노이즈를 고정 시드로 → 재계획"
-                         "(receding-horizon) 간 일관된 단일 모드 유지(naive fresh-noise의 mode-switching 배회 방지). "
-                         "residual_flow는 평균 앵커가 이미 안정적이라 잔차 노이즈만 고정. 미지정 시 재계획마다 독립 샘플.")
+                    help="[DEPRECATED] --flow-noise-mode walk 의 별칭. 주의: 생성기가 호출마다 "
+                         "전진하므로 재계획 간 '같은 노이즈'가 아님(진짜 고정은 locked).")
+    ap.add_argument("--run-tag", default=None,
+                    help="provenance 디렉토리 outputs/eval/runs/<run_tag>/ 이름. "
+                         "기본: <phase2 ckpt stem>_<instruction_mode>_<YYYYmmdd_HHMMSS> (충돌 없음)")
     args = ap.parse_args()
+    if args.flow_fixed_noise:                        # 구 플래그 → walk 별칭 (동작 동일)
+        print("[DEPRECATED] --flow-fixed-noise 는 --flow-noise-mode walk 로 대체되었습니다 "
+              "(동작 동일: 에피소드당 1회 시딩, 생성기 전진).", flush=True)
+        if args.flow_noise_mode == "fresh":
+            args.flow_noise_mode = "walk"
+    locked = args.flow_noise_mode == "locked"
 
     from libero.libero import benchmark, get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
@@ -74,6 +91,27 @@ def main():
      repr_kind, wrist_cam, obs_anchors, obs_fusion, f4, dual,
      grid_anchor, grid_obs) = load_models(cfg, device)
     is_hflow = getattr(ae, "h_mode", "mlp") in ("flow", "residual_flow")   # flow/residual_flow h면 generator 전달 가능
+    pol_flow = hasattr(policy, "_x0")               # FlowPolicy만 generator kwarg 수용 (MLPConcat 미수용)
+
+    # ---- 에피소드 provenance (항상 기록, 추가 전용 — 기존 stdout/txt 출력 불변) ----
+    # RNG 무소비·롤아웃 제어흐름 무영향. 라인마다 flush+fsync → 렌더러 segfault에도 부분 로그 생존.
+    run_tag = args.run_tag or "{}_{}_{}".format(
+        Path(os.path.expanduser(cfg["train"]["checkpoint"])).stem,
+        args.instruction_mode, time.strftime("%Y%m%d_%H%M%S"))
+    run_dir = WS / "outputs" / "eval" / "runs" / run_tag
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ep_log_path = run_dir / "episodes.jsonl"
+    print(f"[provenance] run_tag={run_tag} → {ep_log_path}", flush=True)
+
+    def log_episode(rec):
+        """에피소드당 1 JSON line append. 기록 실패는 경고만 (롤아웃 진행 무영향)."""
+        try:
+            with open(ep_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:
+            print(f"경고: episodes.jsonl 기록 실패 — {e}", flush=True)
     af = getattr(policy, "flow_space", "latent") == "action"   # ★SWAP: 정책 출력이 곧 액션 → ae.h BYPASS
     if af:
         print("[ACTION-FLOW] policy.flow_space=action — ζ̂=액션청크 직접 사용(ae.h 디코딩 bypass), "
@@ -180,10 +218,23 @@ def main():
             return [gt[:, k] for k in range(gt.size(1))]
 
         for ep in range(args.episodes):
-            ep_gen = None                            # h-flow: 에피소드당 고정 노이즈(옵션)
-            if args.flow_fixed_noise and is_hflow:
+            ep_wall0 = time.time()                   # provenance: 에피소드 벽시계 시작
+            ep_seed = 10000 * tid + ep               # 에피소드 flow 시드 (구 --flow-fixed-noise와 동일 규약)
+            ep_gen = None                            # fresh: 생성기 없음(전역 RNG) = 기존 기본 경로
+            if args.flow_noise_mode == "walk" and is_hflow:
+                # walk = 구 --flow-fixed-noise 그대로: 1회 시딩, 이후 호출마다 생성기 전진
                 ep_gen = torch.Generator(device=device)
-                ep_gen.manual_seed(10000 * tid + ep)
+                ep_gen.manual_seed(ep_seed)
+            elif locked:
+                # locked = 진짜 mode-lock: flow_gen()이 매 샘플 호출 직전 ep_seed로 재시딩
+                ep_gen = torch.Generator(device=device)
+
+            def flow_gen():
+                """flow 샘플 호출 직전 훅. locked면 ep_seed 재시딩(→ x0 재계획 불변),
+                walk면 전진 중인 ep_gen 그대로, fresh면 None. RNG 무소비(시딩만)."""
+                if locked:
+                    ep_gen.manual_seed(ep_seed)
+                return ep_gen
             env.reset()
             obs = env.set_init_state(init_states[ep % len(init_states)])
             for _ in range(5):                       # 물리 안정화 (LIBERO 관례)
@@ -214,7 +265,10 @@ def main():
                             x, (0, dcw - x.shape[-1]))
                         toks = [_pad(zp), _pad(zc), a_emb, _pad(zwp), _pad(zwc)] \
                             + ([_pad(lang)] if use_lang else [])
-                        zeta = policy(torch.stack(toks, dim=1))
+                        if locked and pol_flow:      # locked: source=noise x0 재시딩(그 외 소스는 RNG 무소비)
+                            zeta = policy(torch.stack(toks, dim=1), generator=flow_gen())
+                        else:                        # fresh/walk: 기존 호출 그대로 (비트 동형)
+                            zeta = policy(torch.stack(toks, dim=1))
                         ahat = chunkrep.from_repr(
                             ae.decode(zeta, zc, zwc).cpu().numpy()[0],
                             repr_kind) * a_std + a_mean
@@ -241,6 +295,7 @@ def main():
                                 torch.nn.functional.pad(t, (0, _zd - t.shape[-1])) for t in toks]
                         if af:   # ★SWAP: action-space flow. x0_src=과거 정규화 액션청크 flatten(=a_emb에 먹인
                                  # `past`, train_phase2 cp.reshape(len,-1) 동형). 정책 출력 ζ̂가 곧 액션청크
+                                 # x0=과거 청크(결정론; eval은 source_noise 미적용) → flow-noise-mode 비대상.
                                  # (n_chunk*act_dim) → ae.h 디코딩 없이 reshape(n_chunk,act_dim)→from_repr→invert.
                             x0_src_t = torch.tensor(past.reshape(1, -1), device=device)
                             zeta = policy(torch.stack(toks, dim=1), x0_src=x0_src_t)
@@ -248,11 +303,15 @@ def main():
                                 zeta.detach().cpu().numpy()[0].reshape(n_chunk, act_dim),
                                 repr_kind) * a_std + a_mean
                         else:    # 잠재 flow(그 외 전 config): 원본 경로 그대로(regression-0)
-                            zeta, zeta_f = sample_zeta(policy, f4, torch.stack(toks, dim=1))
+                            # locked: 정책 x0(source=noise)·f4 ζ_f 노이즈도 호출 직전 재시딩해 잠금.
+                            # fresh/walk: generator=None → 기존 sample_zeta 호출과 완전 동일(비트 동형).
+                            zeta, zeta_f = sample_zeta(
+                                policy, f4, torch.stack(toks, dim=1),
+                                generator=flow_gen() if locked and pol_flow else None)
                             if args.ablate_zf and zeta_f is not None:   # 병목-효능 프로브: ζ_f 기여 0
                                 zeta_f = torch.zeros_like(zeta_f)       # (미지정 시 이 분기 미실행=비트 동형)
-                            ahat_lat = ae.h(zeta, zc, generator=ep_gen) if is_hflow \
-                                else ae.h(zeta, zc)          # frozen h(ζ_g, z_cur); flow면 에피소드 고정노이즈
+                            ahat_lat = ae.h(zeta, zc, generator=flow_gen()) if is_hflow \
+                                else ae.h(zeta, zc)          # frozen h(ζ_g, z_cur); flow면 노이즈 모드 적용
                             if f4 is not None:               # C1: + tanh(β)·fine_head([ζ_g,ζ_f,z_cur])
                                 ahat_lat = ahat_lat + f4.fine_action(zeta, zeta_f, zc)
                             ahat = chunkrep.from_repr(
@@ -289,6 +348,33 @@ def main():
                 succ.append(ok)
                 print(f"[task {tid}] ep {ep:2d} | {'SUCCESS' if ok else 'fail'} "
                       f"| steps {t} | 추론 {np.mean(infer_ms):.1f}ms", flush=True)
+            rec = {                                  # provenance 1 line/episode (추가 전용)
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "suite": args.suite,
+                "task_id": tid,
+                "task_name": getattr(task, "name", None),
+                "task_language": task.language,
+                "episode_index": ep,
+                "success": bool(succ[-1]),           # swap 모드에선 primary=instructed(bowl_2)
+                "n_steps": t,
+                "wall_seconds": round(time.time() - ep_wall0, 2),
+                "instruction_mode": args.instruction_mode,
+                "config": Path(args.config).name,
+                "phase1_ckpt": str(cfg["phase1_ckpt"]),
+                "phase2_ckpt": str(cfg["train"]["checkpoint"]),
+                "anchor": (cfg.get("anchor") or {}).get("name", "clip"),
+                "train_seed": cfg.get("train", {}).get("seed"),
+                "init_state_idx": ep % len(init_states),
+                "flow_noise_mode": args.flow_noise_mode,
+                "flow_seed": ep_seed if ep_gen is not None else None,
+                "h_mode": getattr(ae, "h_mode", "mlp"),
+                "ablate_zf": args.ablate_zf,
+                "action_flow": af,
+            }
+            if is_swap:                              # 1c 3율 원자료도 함께 보존
+                rec["swap_instructed"] = bool(instructed)
+                rec["swap_orig"] = ok
+            log_episode(rec)
             if ep < args.save_video and frames:
                 import imageio
                 videos_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +422,31 @@ def main():
                 f"neither {m_n:.1f}%\n")
     out.write_text(txt)
     print(f"저장: {out}")
+
+    # ---- provenance summary (episodes.jsonl 와 동일 run 디렉토리; 레거시 txt는 위에서 유지) ----
+    summary = {
+        "run_tag": run_tag,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "suite": args.suite,
+        "task_ids": task_ids,
+        "episodes_per_task": args.episodes,
+        "instruction_mode": args.instruction_mode,
+        "flow_noise_mode": args.flow_noise_mode,
+        "config": Path(args.config).name,
+        "phase1_ckpt": str(cfg["phase1_ckpt"]),
+        "phase2_ckpt": str(cfg["train"]["checkpoint"]),
+        "anchor": (cfg.get("anchor") or {}).get("name", "clip"),
+        "h_mode": getattr(ae, "h_mode", "mlp"),
+        "ablate_zf": args.ablate_zf,
+        "per_task_sr": {str(t): s for t, s in results.items()},
+        "mean_sr": float(np.mean(list(results.values()))),
+    }
+    if is_swap:                                      # 1c: 3율 브레이크다운 포함
+        summary["swap"] = {str(t): {"instructed": i, "orig": o, "neither": n}
+                           for t, (i, o, n) in swap_results.items()}
+    (run_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    print(f"저장: {run_dir / 'summary.json'}")
 
 
 if __name__ == "__main__":
