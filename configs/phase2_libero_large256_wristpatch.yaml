@@ -1,0 +1,74 @@
+# Phase 2 — W-A "WristPatch-Cond" (WristCond-v1 MAIN): large256-single + wrist DINOv3 pool2 grid 4토큰.
+# ══════════════════════════════════════════════════════════════════════════
+# DESIGN_wrist_fusion_unified_v1 §2.1/§3.2: 단일 스트림 통화 불변(ζ=ζ_main, phase1 동결 재사용),
+# wrist는 조건화-only 풍부화 — 기존 SigLIP2-wrist 토큰 유지 + DINOv3-L/16 wrist 패치 2×2 pool
+# 4토큰 UNGATED 추가. 토큰열 = [z_prev, z_cur, g(A_past), lang, wrist_sig, wristpatch×4] = 9.
+# N1: 사영 전 LayerNorm(ln:true) / 언어-보호 dropout tok_drop·group_drop 0.1 / proj init_std 0.02.
+# grid_obs 미지원 키는 train_phase2 loud-fail (VERIFY A1). wrist 프레임 crop 없음(force_size=256).
+# 캐시: dinov3-vitl16-256-pool2 신설 dense 키로 자동 분리 (~1.0GB), pooled 캐시는 기존 재사용.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # pooled 재사용; dense는 cache_key 하위로 분리
+
+anchor:                          # 본류 관측 = large256 (매치드 베이스와 동일)
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true              # 기존 SigLIP2-wrist 조건 토큰 유지 (교체 아님 — 병기)
+  grid_obs:                      # ★W-A: wrist DINOv3 패치 2×2-pool 4토큰 (UNGATED, §2.1)
+    anchor:
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      force_size: 256            #   256/16 = 16×16 patch → 인코딩 시점 2×2 avg-pool
+      pool_to: 2                 #   cache_key dinov3-vitl16-256-pool2 (dense 캐시 자동 분리)
+    camera: eye_in_hand_rgb      #   wrist 카메라 (crop 없음 — P-A crop은 main 전용)
+    n_tokens: 4                  #   2×2 = 4 grid 토큰 (K=16 확전은 W-A 승리 후에만)
+    pool: avg                    #   파라미터-0 공간 풀 (입력이 이미 2×2라 항등)
+    ln: true                     #   N1: 사영 전 LayerNorm(patch_dim) — F3 kv-LN 결함의 param-최소 대응
+    tok_drop: 0.1                #   per-token zero-drop (학습시만; zero-ablation 동형)
+    group_drop: 0.1              #   K토큰 동시 0화 — 언어-only 경로 보존 강제
+    init_std: 0.02               #   proj weight N(0, 0.02²), bias 0 (설계 규격)
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_large256_wristpatch.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_large256_wristpatch}

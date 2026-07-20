@@ -271,7 +271,8 @@ class LiberoDataset:
         return out
 
     def build_policy_samples(self, clip, files=None, stride=2, obs_anchors=None,
-                             f4_anchor=None, wrist_anchor=None):
+                             f4_anchor=None, wrist_anchor=None, obs_delta=False,
+                             wrist_cond_anchor=None):
         """연속 윈도우 삼중쌍 (경계 포함 — 롤아웃 부트스트랩 분포 커버).
 
         obs_anchors: [(name, anchor, camera), ...] (F3 obs-fusion). 주어지면 각
@@ -281,6 +282,18 @@ class LiberoDataset:
         f4_anchor: (anchor, camera) (C1/F4 fine 채널). 주어지면 patch ΔF =
         D[t+span] − D[t] (동일 인덱스 patch 차분, agentview 정적 카메라 전제 — D0)를
         (n, P, dense_dim)로 맨 뒤에 덧붙인다. None(기본)이면 출력 불변.
+
+        obs_delta (W-B Δ̄w-token, DESIGN_wrist_fusion_unified_v1 §2.4): True면
+        **첫 번째 obs 앵커**(grid_obs = wrist pool2 dense)의 patch-mean 과거 변위
+        Δz̄_w(t) = D[t].mean(0) − D[max(t−span,0)].mean(0) 를 (n, d) 1배열로 dense
+        배열들 **뒤에** 덧붙인다 (재척도 σ_ref/σ_Δ 는 train_phase2 가 train 통계로
+        수행). t<span 은 D[0] 클램프 — 롤아웃 링버퍼 워밍업과 동형. False(기본)면
+        출력 불변(byte-identical).
+
+        wrist_cond_anchor (W-C 결함⑤ 격리): dual(wrist_anchor 병용) 전용. 주어지면
+        해당 앵커(main SigLIP2)로 인코딩한 손목캠 **cur 1배열** (n, D)을 dual 배열
+        (6·7·8번째) 뒤 9번째로 덧붙인다 — 조건 토큰을 단일-스트림 baseline 과 동일한
+        SigLIP2-wrist 로 유지하기 위함. None(기본)이면 출력 불변.
 
         Exp2 both-aug (data.augment): aug_view=N/aug_wrist=N>0이면 해당 카메라
         Z를 (n, M, D) variant 뱅크로 반환(variant0=클린). 둘 다 0(기본)이면 아래
@@ -322,6 +335,9 @@ class LiberoDataset:
                 arrs += [np.stack([Zw[max(t - self.span, 0)] for t in starts]),
                          np.stack([Zw[t] for t in starts]),
                          np.stack([Zw[t + self.span] for t in starts])]       # 6·7·8번째
+                if wrist_cond_anchor is not None:    # W-C: SigLIP2-wrist 조건 cur (9번째)
+                    Zs = self.embeddings(wrist_cond_anchor, ep, self.wrist_camera)
+                    arrs.append(np.stack([Zs[t] for t in starts]))
             elif self.wrist_camera:                  # 단일 스트림: 손목캠 z_t (정책 토큰용, 6번째)
                 if wrist_aug:
                     Zw = self.cam_aug_embeddings(clip, ep, self.wrist_camera,
@@ -330,9 +346,18 @@ class LiberoDataset:
                 else:
                     Zw = self.embeddings(clip, ep, self.wrist_camera)
                     arrs.append(np.stack([Zw[t] for t in starts]))
+            D_first = None                                   # W-B: 첫 obs 앵커 dense 보관
             for _name, anchor, cam in (obs_anchors or []):   # F3: 관측 앵커별 dense
                 D = self.dense_embeddings(anchor, ep, cam)   # [T, P, d]
+                if D_first is None:
+                    D_first = D
                 arrs.append(np.stack([D[t] for t in starts]))
+            if obs_delta:                                    # W-B: patch-mean 과거 변위 (raw)
+                assert D_first is not None, \
+                    "obs_delta: obs_anchors(grid dense) 필요 — W-B는 pool2 캐시에서 유도"
+                arrs.append(np.stack(
+                    [D_first[t].mean(0) - D_first[max(t - self.span, 0)].mean(0)
+                     for t in starts]))                      # (n, d) — 항상 dense 뒤 마지막
             if f4_anchor is not None:                        # C1/F4: patch ΔF (동일인덱스 차분)
                 f4_anc, f4_cam = f4_anchor
                 D = self.dense_embeddings(f4_anc, ep, f4_cam)   # [T, P, d]

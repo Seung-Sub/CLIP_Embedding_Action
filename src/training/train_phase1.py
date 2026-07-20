@@ -117,9 +117,19 @@ def run_dual(cfg, args):
         wb = wandb.init(project=wb_cfg["project"], name=wb_cfg.get("run_name"),
                         mode=wb_cfg.get("mode", "offline"), config=cfg)
 
+    stream_std = bool(m_cfg.get("stream_standardize", False))   # W-C N3 (기본 off=비트 동형)
     model = DualDeltaAE(act_dim, n_chunk, dim_main, dim_wrist, m_cfg["hidden"],
                         m_cfg["layers"], m_cfg["dropout"],
-                        m_cfg.get("state_cond", True)).to(device)
+                        m_cfg.get("state_cond", True),
+                        stream_standardize=stream_std).to(device)
+    if stream_std:
+        # N3: 결함 ① 수리 — 위 print 만 하던 train Δz std 를 buffer 로 승격 주입.
+        # buffer 는 state_dict 에 포함 → ckpt 저장·phase2/rollout 재구성 시 자동 복원.
+        model.dz_std_main.fill_(float(max(Dm_tr.std(), 1e-8)))
+        model.dz_std_wrist.fill_(float(max(Dw_tr.std(), 1e-8)))
+        print(f"[dual] N3 stream_standardize: dz_std_main={model.dz_std_main.item():.4f} "
+              f"/ dz_std_wrist={model.dz_std_wrist.item():.4f} "
+              f"(align 타깃·h 입력 = per-stream z-score 공간)")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[dual] DualDeltaAE params: {n_params/1e6:.2f}M "
           f"(g_main→{dim_main}, g_wrist→{dim_wrist}, h in {model.dim_cat}*2)")
@@ -151,6 +161,26 @@ def run_dual(cfg, args):
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     align_type = m_cfg.get("align_type", "mse_cos")
+
+    # ---- W-C 결함 ④: 항별 grad-norm 로깅 (stream_std 전용 — off면 아래 전부 미실행) ----
+    if stream_std:
+        nb = min(len(C_tr), t_cfg["batch_size"])
+        probe = tuple(torch.tensor(np.asarray(x)[:nb], device=device)
+                      for x in (C_tr, Dm_tr, Dw_tr, Zt_tr, Zwt_tr))
+
+        def _term_grad_norms():
+            """고정 probe 배치에서 항별(align_m/align_w/recon/cycle) grad-norm.
+            autograd.grad 사용 — .grad 미기록, opt 상태 무영향 (로깅 전용)."""
+            terms = model.loss_terms(*probe, align_type)
+            params = [p for p in model.parameters() if p.requires_grad]
+            out = {}
+            for k, lt in terms.items():
+                gs = torch.autograd.grad(lt, params, retain_graph=True,
+                                         allow_unused=True)
+                out[f"gradnorm/{k}"] = float(torch.sqrt(sum(
+                    g.pow(2).sum() for g in gs if g is not None)))
+            return out
+
     t0 = time.time()
     for ep in range(epochs):
         model.train()
@@ -164,6 +194,7 @@ def run_dual(cfg, args):
                 sched.step()
             logs.append(loss.item()); part_logs.append(parts)
         model.eval()
+        gnorms = _term_grad_norms() if stream_std else {}      # 결함 ④ (off = 빈 dict)
         with torch.no_grad():
             val_loss, val_parts = model.losses(Cv, Dmv, Dwv, Zmv, Zwv, w, align_type)
         val_loss = val_loss.item()
@@ -178,10 +209,14 @@ def run_dual(cfg, args):
                            for k in part_logs[0]}
             wb.log({"epoch": ep, "train/total": np.mean(logs),
                     "val/total": val_loss, **train_parts,
-                    **{f"val/{k}": v for k, v in val_parts.items()}})
+                    **{f"val/{k}": v for k, v in val_parts.items()},
+                    **gnorms})                       # 결함 ④ (stream_std off = 빈 dict → 불변)
         if ep % 10 == 0 or ep == epochs - 1:
             print(f"ep {ep:3d} | train {np.mean(logs):.4f} | val {val_loss:.4f} "
                   f"({val_parts}) | patience {patience}")
+            if gnorms:
+                print("      " + " | ".join(f"{k} {v:.3e}"
+                                            for k, v in gnorms.items()))
         if patience >= t_cfg["early_stop_patience"]:
             print(f"early stop @ ep {ep}")
             break
@@ -192,7 +227,9 @@ def run_dual(cfg, args):
     model.eval()
     with torch.no_grad():
         gm = model.g_main(Cv, Zmv); gw = model.g_wrist(Cv, Zwv)
-        ahat = model.decode(torch.cat([Dmv, Dwv], 1), Zmv, Zwv).cpu().numpy()
+        # N3: decode 는 표준화 공간 입력을 소비 — raw Δz 는 std_dz 경유(off면 항등=비트 동형)
+        Dmv_s, Dwv_s = model.std_dz(Dmv, Dwv)
+        ahat = model.decode(torch.cat([Dmv_s, Dwv_s], 1), Zmv, Zwv).cpu().numpy()
         acyc = model.decode(torch.cat([gm, gw], 1), Zmv, Zwv).cpu().numpy()
         gm_np, gw_np = gm.cpu().numpy(), gw.cpu().numpy()
     ahat = ahat.reshape(len(Cv), -1); acyc = acyc.reshape(len(Cv), -1)

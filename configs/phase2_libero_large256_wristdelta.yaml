@@ -1,0 +1,75 @@
+# Phase 2 — W-B "Δ̄w-token" (WristCond-v1 ABL-1): W-A + 측정된 과거 손목 변위 1토큰.
+# ══════════════════════════════════════════════════════════════════════════
+# DESIGN_wrist_fusion_unified_v1 §2.4/§3.2: W-A(wristpatch) 구성에 grid_obs.wrist_delta 만 추가.
+#   w_tok = Δz̄_w(t) · (σ_ref/σ_Δ),  Δz̄_w(t) = p̄(t) − p̄(t−span),  p̄ = wrist pool2 patch-mean.
+#   • **과거** 변위 — 롤아웃 인과 가용 (재계획 주기 링버퍼, 미래 무접근). 신규 인코딩/캐시 0.
+#   • N2 재척도: σ_Δ=std(Δz̄_w,train), σ_ref=std(z_cur,train) — 두 스칼라 ckpt("wrist_delta_std") 저장.
+#   • canonical 토큰 순서 [AMEND A2]: base(#1–5) → grid(#6–9) → **w_tok(#10, 항상 마지막)**. n_tokens=10.
+# 선행 게이트 G0 (§5.1): ridge [Δz̄_w,past, z̄_w] gripper-dim 우위 ≥ +0.05 — 미달 시 이 팔은 학습 없이 폐기.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # pooled 재사용; dense는 cache_key 하위로 분리
+
+anchor:                          # 본류 관측 = large256 (매치드 베이스와 동일)
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true              # 기존 SigLIP2-wrist 조건 토큰 유지 (교체 아님 — 병기)
+  grid_obs:                      # W-A 기반: wrist DINOv3 패치 2×2-pool 4토큰 (UNGATED, §2.1)
+    anchor:
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      force_size: 256            #   256/16 = 16×16 patch → 인코딩 시점 2×2 avg-pool
+      pool_to: 2                 #   cache_key dinov3-vitl16-256-pool2 (dense 캐시 자동 분리)
+    camera: eye_in_hand_rgb      #   wrist 카메라 (crop 없음 — P-A crop은 main 전용)
+    n_tokens: 4                  #   2×2 = 4 grid 토큰
+    pool: avg
+    ln: true                     #   N1: 사영 전 LayerNorm(patch_dim)
+    tok_drop: 0.1
+    group_drop: 0.1
+    init_std: 0.02
+    wrist_delta: true            # ★W-B: w_tok(#10, 마지막) — pool2 patch-mean 과거 변위 + N2 재척도
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_large256_wristdelta.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_large256_wristdelta}

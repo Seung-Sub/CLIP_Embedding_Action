@@ -1,0 +1,70 @@
+# Phase 2 (LIBERO) — W-C "dual 표준화 재판" (WristCond-v1 ABL-2), no-aug clean.
+# ══════════════════════════════════════════════════════════════════════════
+# phase2_libero_dualstream_wrist_noaug.yaml 의 결함 수리판 (DESIGN §3.4):
+#   • N3: phase1 = stream_standardize dual ckpt — ζ 통화가 per-stream 표준화 공간
+#     (ae.encode 가 표준화 ζ 출력, ae.decode 가 표준화 ζ̂ 소비 — 역변환 불요).
+#   • N4 (결함 ②): module.x0_per_dim=true — FlowPolicy.x0_std 를 (flow_dim,) per-dim
+#     buffer 로 (`lt.std(0)` 주입). 단일 스칼라(0.0724)의 wrist 블록 오염 차단.
+#   • 결함 ⑤ (confound 제거): module.wrist_cond_sig=true — 조건 토큰열을 단일-스트림
+#     baseline 과 동일한 [z_prev, z_cur, g(A_past), zw_sig(SigLIP2-wrist cur), lang] 5토큰으로.
+#     DINOv3-CLS prev/cur **조건 토큰 제거** (h/g 상태로는 계속 사용 — rollout zw_hist 유지).
+#     이 팔의 유일 기전 = 타깃-측 ζ_wrist (지도-완결판). 조건 기질은 검증된 SigLIP2-wrist.
+# 예측 (§5.3): ΔCI∋0 (널 유지)가 본 설계의 예측 — 뒤집히면 F1 발동(§6).
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_dualstream_wrist_std.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb        # dual 손목 변위 스트림 (필수)
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256   # phase1과 동일 (main/wrist cache_key 분리)
+
+anchor:                                # main (phase1과 동일)
+  name: siglip2
+  model_dir: google/siglip2-large-patch16-256
+  projection: joint
+  normalize: false
+
+anchor_wrist:                          # wrist 상태 스트림 (phase1과 동일; 조건 토큰 아님)
+  name: dinov3
+  model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+  pooled: cls
+  normalize: true
+
+module:
+  name: flow                           # dual은 flow 전용 (run_dual assert)
+  flow_source: past                    # x0 = g(A_past) = concat ζ_past (토큰 idx 2)
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true                     # 멀티태스크 언어 조건화
+  dual_stream: true                    # dual-stream 경로 활성
+  x0_per_dim: true                     # ★W-C N4: x0_std per-dim (블록 분산 보존)
+  wrist_cond_sig: true                 # ★W-C 결함⑤: 조건=SigLIP2-wrist 1토큰 (DINOv3 조건 제거)
+
+loss:
+  lat: 0.5                             # concat ζ CFM (표준화 공간)
+  act: 1.0                             # dual h 디코딩 액션 L1
+  wm: 0.0                              # (auxiliary; 표준화 Δz cos — N3 시 자동 정합)
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_dualstream_wrist_std.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_dualstream_wrist_std}

@@ -62,7 +62,7 @@ class FlowPolicy(nn.Module):
     def __init__(self, d_model=1024, layers=4, heads=None, n_tokens=3,
                  steps=6, source="past", ctx_layers=2, source_noise=0.1,
                  latent_dim=768, dropout=0.0,
-                 flow_space="latent", action_flat_dim=None):
+                 flow_space="latent", action_flat_dim=None, x0_per_dim=False):
         super().__init__()
         assert source in ("noise", "past", "vision")
         self.steps, self.source, self.source_noise = steps, source, source_noise
@@ -94,7 +94,12 @@ class FlowPolicy(nn.Module):
                                         for _ in range(layers)])
         self.v_out = nn.Sequential(nn.LayerNorm(d_model),
                                    nn.Linear(d_model, self.flow_dim))
-        self.register_buffer("x0_std", torch.ones(1))
+        # W-C **N4** (x0_per_dim=True, guarded): x0_std 를 (flow_dim,) per-dim buffer 로
+        # 등록 — dual [ζ_main;ζ_wrist] 처럼 블록별 분산이 다른 타깃에서 단일 스칼라가
+        # 저분산 블록(wrist) x0 를 main 스케일로 오염(결함 ②)하는 것을 차단.
+        # False(기본) = 기존 shape (1) 스칼라 → 기존 ckpt·RNG·수치 비트 동형.
+        self.register_buffer("x0_std", torch.ones(self.flow_dim) if x0_per_dim
+                             else torch.ones(1))
 
     def _v(self, x, ctx, t):
         h = self.v_in(torch.cat([x, ctx, self.t_embed(t)], dim=1))
@@ -161,7 +166,8 @@ def build_policy_from_cfg(m, n_tokens=3, latent_dim=768, action_flat_dim=None):
                   source_noise=m.get("source_noise", 0.1),
                   dropout=m.get("dropout", 0.0),     # 기본 0.0 = 기존과 비트 동형
                   flow_space=m.get("flow_space", "latent"),   # ★SWAP: 'action'=액션청크 직접 flow (기본 latent=regression-0)
-                  action_flat_dim=action_flat_dim)
+                  action_flat_dim=action_flat_dim,
+                  x0_per_dim=m.get("x0_per_dim", False))      # W-C N4 (기본 False = 스칼라, 비트 동형)
     return MODULES[m["name"]](**kw)
 
 

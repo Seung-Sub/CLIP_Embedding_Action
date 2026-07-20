@@ -122,8 +122,21 @@ def load_models(cfg, device):
         grid_obs = grid_obs.to(device).eval()
         Kg = grid_obs.n_tokens
 
+    # ---- W-B Δ̄w-token (grid_obs.wrist_delta=true 일 때만; 없으면 wdelta=None = 기존 동형) ----
+    #  N2 재척도 스칼라(train 통계)는 phase2 ckpt dict "wrist_delta_std" 에서 복원 —
+    #  rollout 은 grid 인코딩(사영 전 pool2 patch-mean)에서 w_tok 을 유도(추가 인코딩 0회).
+    wdelta = None
+    if grid_obs is not None and m["grid_obs"].get("wrist_delta", False):
+        wds = ck2.get("wrist_delta_std")
+        assert wds is not None, \
+            "wrist_delta: phase2 ckpt 에 wrist_delta_std(N2 스칼라) 없음 — 재학습 필요"
+        wdelta = {"scale": float(wds["scale"]),
+                  "sigma_ref": float(wds["sigma_ref"]),
+                  "sigma_delta": float(wds["sigma_delta"])}
+
     policy = build_policy_from_cfg(
-        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K + Kg,
+        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K + Kg
+        + int(wdelta is not None),
         latent_dim=p1["model"]["latent_dim"],
         action_flat_dim=ck1["n_chunk"] * ck1["action_dim"]).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
@@ -162,39 +175,47 @@ def load_models(cfg, device):
         f4 = f4.to(device).eval()
 
     # obs_anchors/obs_fusion/f4/grid_obs 는 해당 모듈일 때만 non-None; 미사용 호출부는 *_로 무시.
-    # dual=None (단일 스트림). grid_anchor/grid_obs 는 14·15번째(뒤에 append → *_ 호출부 안전).
+    # dual=None (단일 스트림). grid_anchor/grid_obs/wdelta 는 14·15·16번째(뒤에 append → *_ 호출부 안전).
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, obs_anchors, obs_fusion, f4, None, grid_anchor, grid_obs)
+            wrist_cam, obs_anchors, obs_fusion, f4, None, grid_anchor, grid_obs,
+            wdelta)
 
 
 def _load_models_dual(cfg, device, ck1):
     """dual-stream 모델 로드 (DualDeltaAE + FlowPolicy). load_models 와 동일 arity의
-    13-튜플 반환 — 13번째 dual dict 로 caller(rollout)가 wrist 앵커/dim_cat/디코딩 분기.
-    obs/f4/aug 는 dual 미지원 → 모두 None. wrist_cam 은 손목 프레임 인코딩용으로 반환."""
+    16-튜플 반환 — 13번째 dual dict 로 caller(rollout)가 wrist 앵커/dim_cat/디코딩 분기.
+    obs/f4/aug 는 dual 미지원 → 모두 None. wrist_cam 은 손목 프레임 인코딩용으로 반환.
+    W-C: stream_standardize(N3)는 phase1 config 로 재구성(buffer 는 state_dict 복원),
+    x0_per_dim(N4)은 build_policy_from_cfg 가 module config 에서 자동 반영,
+    wrist_cond_sig(결함⑤ 격리)는 dual dict 로 caller 에 전달(토큰열 분기)."""
     p1 = ck1["config"]
     dim_main, dim_wrist = ck1["dim_main"], ck1["dim_wrist"]
     dc = dim_main + dim_wrist
     ae = DualDeltaAE(ck1["action_dim"], ck1["n_chunk"], dim_main, dim_wrist,
                      p1["model"]["hidden"], p1["model"]["layers"],
                      p1["model"]["dropout"],
-                     p1["model"].get("state_cond", True)).to(device).eval()
+                     p1["model"].get("state_cond", True),
+                     stream_standardize=p1["model"].get(
+                         "stream_standardize", False)).to(device).eval()
     ae.load_state_dict(ck1["state_dict"])
     ck2 = torch.load(os.path.expanduser(cfg["train"]["checkpoint"]),
                      map_location="cpu", weights_only=False)
     m = ck2["config"]["module"]
     use_lang = m.get("lang_token", False)
-    policy = build_policy_from_cfg(m, n_tokens=5 + int(use_lang),
+    wc_sig = bool(m.get("wrist_cond_sig", False))   # W-C: [zp,zc,a_emb,zw_sig](+lang)=4+lang
+    policy = build_policy_from_cfg(m, n_tokens=(4 if wc_sig else 5) + int(use_lang),
                                    latent_dim=dc).to(device).eval()
     policy.load_state_dict(ck2["state_dict"])
     wrist_cam = ck2["config"]["data"].get("wrist_camera")
     assert wrist_cam, "dual_stream: data.wrist_camera 필요"
     dual = {"dim_main": dim_main, "dim_wrist": dim_wrist, "dim_cat": dc,
-            "anchor_wrist": ck2["config"]["anchor_wrist"]}
-    # use_lang 만 의미; use_wrist/obs/f4/grid 는 dual 경로에서 미사용(None).
+            "anchor_wrist": ck2["config"]["anchor_wrist"],
+            "wrist_cond_sig": wc_sig}
+    # use_lang 만 의미; use_wrist/obs/f4/grid/wdelta 는 dual 경로에서 미사용(None).
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, None, None, None, dual, None, None)
+            wrist_cam, None, None, None, dual, None, None, None)
 
 
 def sample_zeta(policy, f4, tokens, generator=None):
@@ -241,7 +262,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4, dual,
-     grid_anchor, grid_obs) = load_models(cfg, device)
+     grid_anchor, grid_obs, wdelta) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     clip_wrist = get_anchor({"anchor": dual["anchor_wrist"]}) if dual else None
@@ -260,6 +281,9 @@ def main():
     # dual: 손목 변위 스트림은 별도 anchor_wrist pooled (prev/cur); 단일: 손목 토큰(main clip).
     Zw = ds.embeddings(clip_wrist if dual else clip, ep, wrist_cam) \
         if (wrist_cam or dual) else None
+    # W-C: 조건용 SigLIP2-wrist cur (main 앵커; DINOv3 Zw 는 h 상태 전용으로 유지)
+    Zw_sig = (ds.embeddings(clip, ep, wrist_cam)
+              if dual and dual.get("wrist_cond_sig") else None)
     # F3: 앵커별 dense patch 토큰 D[t] (Z[t]=z_cur 와 동일 인덱스 정렬)
     D_obs = ([(name, ds.dense_embeddings(anc, ep, cam))
               for name, anc, cam in obs_anchors] if obs_fusion is not None else [])
@@ -289,8 +313,13 @@ def main():
                 zwc = torch.tensor(Zw[t][None], device=device)
                 a_emb = ae.encode(past_t, z_prev, zwp)         # concat ζ_past (dc)
                 _pad = lambda x: torch.nn.functional.pad(x, (0, dcw - x.shape[-1]))
-                toks = [_pad(z_prev), _pad(z_cur), a_emb, _pad(zwp), _pad(zwc)] \
-                    + ([_pad(lang)] if use_lang else [])
+                if dual.get("wrist_cond_sig"):        # W-C: 조건=[zp,zc,a_emb,zw_sig](+lang)
+                    zw_sig = torch.tensor(Zw_sig[t][None], device=device)
+                    toks = [_pad(z_prev), _pad(z_cur), a_emb, _pad(zw_sig)] \
+                        + ([_pad(lang)] if use_lang else [])
+                else:                                 # 기존 dual 6토큰 (비트 동형)
+                    toks = [_pad(z_prev), _pad(z_cur), a_emb, _pad(zwp), _pad(zwc)] \
+                        + ([_pad(lang)] if use_lang else [])
                 zeta = policy(torch.stack(toks, dim=1))
                 ahat = chunkrep.from_repr(
                     ae.decode(zeta, z_cur, zwc).cpu().numpy()[0],
@@ -307,6 +336,10 @@ def main():
                 if grid_obs is not None:              # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
                     grid_tok = grid_obs(torch.tensor(D_grid[t][None], device=device))
                     toks = toks + [grid_tok[:, k] for k in range(grid_tok.size(1))]
+                if wdelta is not None:                # W-B w_tok #10 — canonical 마지막 (A2)
+                    wd = ((D_grid[t].mean(0) - D_grid[max(t - span, 0)].mean(0))
+                          * wdelta["scale"]).astype(np.float32)
+                    toks = toks + [torch.tensor(wd[None], device=device)]
                 zeta = policy(torch.stack(toks, dim=1))
                 ahat = chunkrep.from_repr(ae.h(zeta, z_cur).cpu().numpy()[0],
                                           repr_kind) * a_std + a_mean

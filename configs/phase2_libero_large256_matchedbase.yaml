@@ -1,0 +1,59 @@
+# Phase 2 — WristCond-v1 MATCHED BASELINE: large256-single phase2 재학습 (같은 주·같은 리비전·같은 split).
+# ══════════════════════════════════════════════════════════════════════════
+# DESIGN_wrist_fusion_unified_v1 §5.2-1: W-A/W-B/W-C 팔 판정의 기준선은 "이번 창에서 재학습한"
+# large256-single phase2 (phase1 ckpt는 전 팔 공유 = pairing). 본 파일 = phase2_libero_siglip2_large256.yaml
+# 과 **하이퍼·시드·split 완전 동일**, 차이는 checkpoint 경로/run_name 뿐 (기존 ckpt 비클로버).
+# F5 반증 조건: 이 재학습이 provenance 레짐에서 85–88 SR을 재현 못 하면 전 팔 판정 중단.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # 기존 pooled 캐시 전부 재사용
+
+anchor:                          # 기질 동일 (pooled ζ_g)
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_large256_matchedbase.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_large256_matchedbase}

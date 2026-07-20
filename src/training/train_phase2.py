@@ -85,11 +85,18 @@ def run_dual(cfg, args):
     ae = DualDeltaAE(act_dim, n_chunk, dim_main, dim_wrist,
                      p1["model"]["hidden"], p1["model"]["layers"],
                      p1["model"]["dropout"],
-                     p1["model"].get("state_cond", True)).to(device)
+                     p1["model"].get("state_cond", True),
+                     # W-C N3: phase1 config 의 플래그로 재구성 → dz_std buffer 키/값이
+                     # state_dict 로드로 복원. 기존 dual ckpt(플래그 없음)는 비트 동형.
+                     stream_standardize=p1["model"].get(
+                         "stream_standardize", False)).to(device)
     ae.load_state_dict(ck["state_dict"])
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
+    if ae.stream_standardize:
+        print(f"[dual] N3 stream_standardize ON: dz_std_main={ae.dz_std_main.item():.4f}"
+              f" / dz_std_wrist={ae.dz_std_wrist.item():.4f} (ζ 통화 = 표준화 공간)")
 
     # ---- 데이터 (main + wrist 삼중쌍) ----
     ds = get_dataset(cfg)
@@ -110,17 +117,26 @@ def run_dual(cfg, args):
         f"앵커 dim 불일치: main {clip_main.dim}/{dim_main}, wrist {clip_wrist.dim}/{dim_wrist}"
     print(f"[dual] anchor_main={clip_main.cache_key}({dim_main}) / "
           f"anchor_wrist={clip_wrist.cache_key}({dim_wrist}) / dim_cat={dc}")
+    # W-C 결함⑤ 격리 (module.wrist_cond_sig=true): 조건 토큰열을 단일-스트림 baseline 과
+    # 동일하게 [zp_m, zc_m, a_emb, zw_sig(SigLIP2-wrist cur), lang] 로 — DINOv3-CLS
+    # prev/cur 조건 토큰 제거(상태로는 encode/decode 에 계속 사용). 이 팔의 유일 기전이
+    # 타깃-측 ζ_wrist 가 되도록 조건 기질 교체 confound 를 제거한다. 기본 false = 기존 6토큰.
+    wc_sig = bool(m_cfg.get("wrist_cond_sig", False))
     print("삼중쌍 구성 중 (임베딩 캐시 재사용)...")
     eps = ds.build_policy_samples(clip_main, files,
                                   stride=cfg["data"].get("stride", 2),
-                                  wrist_anchor=clip_wrist)
+                                  wrist_anchor=clip_wrist,
+                                  wrist_cond_anchor=clip_main if wc_sig else None)
 
     def stack(ids):
         return tuple(np.concatenate([eps[i][k] for i in ids])
-                     for k in range(len(eps[0])))   # Zp,Zc,Zn,Ap,Af,Zwp,Zwc,Zwn
+                     for k in range(len(eps[0])))   # Zp,Zc,Zn,Ap,Af,Zwp,Zwc,Zwn(,Ws)
 
-    Zp_tr, Zc_tr, Zn_tr, Ap_tr, Af_tr, Zwp_tr, Zwc_tr, Zwn_tr = stack(tr_ids)
-    Zp_va, Zc_va, Zn_va, Ap_va, Af_va, Zwp_va, Zwc_va, Zwn_va = stack(val_ids)
+    cols_tr, cols_va = stack(tr_ids), stack(val_ids)
+    Zp_tr, Zc_tr, Zn_tr, Ap_tr, Af_tr, Zwp_tr, Zwc_tr, Zwn_tr = cols_tr[:8]
+    Zp_va, Zc_va, Zn_va, Ap_va, Af_va, Zwp_va, Zwc_va, Zwn_va = cols_va[:8]
+    Ws_tr = cols_tr[8] if wc_sig else None          # W-C: SigLIP2-wrist 조건 cur (9번째)
+    Ws_va = cols_va[8] if wc_sig else None
 
     use_lang = m_cfg.get("lang_token", False)
     if use_lang:
@@ -149,40 +165,53 @@ def run_dual(cfg, args):
         wb = wandb.init(project=wb_cfg["project"], name=wb_cfg.get("run_name"),
                         mode=wb_cfg.get("mode", "online"), config=cfg)
 
-    n_tokens = 5 + int(use_lang)      # [zp_m, zc_m, a_emb, zp_w, zc_w] (+lang)
+    # W-C: 조건 [zp_m, zc_m, a_emb, zw_sig] (+lang) = 4+lang / 기존 dual: 5+lang
+    n_tokens = (4 if wc_sig else 5) + int(use_lang)
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens, latent_dim=dc).to(device)
     assert isinstance(model, FlowPolicy) and model.flow_dim == dc
+    x0_per_dim = bool(m_cfg.get("x0_per_dim", False))    # W-C N4 (결함 ② 수리)
     with torch.no_grad():             # x0_std = concat 잠재 타깃 분포
         lt = ae.encode(torch.tensor(Cf_tr[:4096], device=device),
                        torch.tensor(Zc_tr[:4096], device=device),
                        torch.tensor(Zwc_tr[:4096], device=device))
-    model.x0_std.fill_(lt.std().item())
+    if x0_per_dim:                    # N4: per-dim(=per-block 일반화) x0_std — 블록 분산 보존
+        model.x0_std.copy_(lt.std(0).clamp_min(1e-8))
+        print(f"[dual] N4 x0_per_dim: x0_std 블록 평균 main {lt.std(0)[:dim_main].mean():.4f}"
+              f" / wrist {lt.std(0)[dim_main:].mean():.4f} (단일 스칼라였으면 {lt.std():.4f})")
+    else:                             # 기존 단일 스칼라 (비트 동형)
+        model.x0_std.fill_(lt.std().item())
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[dual] policy[flow] params: {n_params/1e6:.2f}M | n_tokens={n_tokens} "
-          f"flow_dim={model.flow_dim} source={model.source} x0_std={model.x0_std.item():.4f}")
+          f"flow_dim={model.flow_dim} source={model.source} x0_std={model.x0_std.mean().item():.4f}")
     opt = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"],
                            betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
 
     past_noise = float(t_cfg.get("past_noise", 0.0))
 
-    def build_tokens(zp_m, zc_m, zwp, zwc, a_emb, lang):
-        toks = [_pad_to(zp_m, dc), _pad_to(zc_m, dc), a_emb,
-                _pad_to(zwp, dc), _pad_to(zwc, dc)]
+    def build_tokens(zp_m, zc_m, zwp, zwc, a_emb, lang, ws=None):
+        if wc_sig:      # W-C 결함⑤ 격리: [zp_m, zc_m, a_emb, zw_sig] (+lang) — A_EMB_IDX=2 유지
+            toks = [_pad_to(zp_m, dc), _pad_to(zc_m, dc), a_emb, _pad_to(ws, dc)]
+        else:           # 기존 dual: [zp_m, zc_m, a_emb, zp_w, zc_w] (+lang) — 비트 동형
+            toks = [_pad_to(zp_m, dc), _pad_to(zc_m, dc), a_emb,
+                    _pad_to(zwp, dc), _pad_to(zwc, dc)]
         if use_lang:
             toks.append(_pad_to(lang, dc))
         return torch.stack(toks, dim=1)
 
-    def forward(zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang, train=True):
+    def forward(zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang, ws=None, train=True):
         with torch.no_grad():
             a_emb = ae.encode(cp, zp_m, zwp)               # concat ζ_past (dc)
             lat_target = ae.encode(cf, zc_m, zwc)          # flow 타깃 concat ζ (dc)
-        toks = build_tokens(zp_m, zc_m, zwp, zwc, a_emb, lang)
+        toks = build_tokens(zp_m, zc_m, zwp, zwc, a_emb, lang, ws)
         gen = None
         if not train:
             gen = torch.Generator(device=device); gen.manual_seed(0)
         zeta, l_fm = model.fm_and_sample(toks, lat_target, generator=gen)
         ahat = ae.decode(zeta, zc_m, zwc)                  # frozen dual 디코딩
-        wm_target = torch.cat([zn_m - zc_m, zwn - zwc], dim=1)   # dc
+        if ae.stream_standardize:   # N3: ζ 통화가 표준화 공간 → wm 타깃도 같은 공간 (off=기존식)
+            wm_target = torch.cat(ae.std_dz(zn_m - zc_m, zwn - zwc), dim=1)
+        else:
+            wm_target = torch.cat([zn_m - zc_m, zwn - zwc], dim=1)   # dc
         cos = torch.nn.functional.cosine_similarity
         l_wm = 0.5 * (1 - cos(zeta, wm_target, dim=1)).mean()
         l_act = torch.nn.functional.l1_loss(ahat, cf)
@@ -190,16 +219,19 @@ def run_dual(cfg, args):
         return total, {"lat": l_fm.item(), "act": l_act.item(), "wm": l_wm.item()}, zeta
 
     L_tr_t = torch.tensor(L_tr) if use_lang else torch.zeros(len(Cp_tr), 0)
+    Ws_extra = [torch.tensor(Ws_tr)] if wc_sig else []      # W-C: zw_sig (마지막 자리)
     loader = DataLoader(
         TensorDataset(torch.tensor(Zp_tr), torch.tensor(Zc_tr), torch.tensor(Zn_tr),
                       torch.tensor(Cp_tr), torch.tensor(Cf_tr),
                       torch.tensor(Zwp_tr), torch.tensor(Zwc_tr), torch.tensor(Zwn_tr),
-                      L_tr_t),
+                      L_tr_t, *Ws_extra),
         batch_size=t_cfg["batch_size"], shuffle=True)
     val_t = [torch.tensor(x, device=device) for x in
              (Zp_va, Zc_va, Zn_va, Cp_va, Cf_va, Zwp_va, Zwc_va, Zwn_va)]
     val_t.append(torch.tensor(L_va, device=device) if use_lang
                  else torch.zeros(len(Cf_va), 0, device=device))
+    if wc_sig:
+        val_t.append(torch.tensor(Ws_va, device=device))    # forward(..., ws=) 위치 정합
     epochs = 3 if args.smoke else t_cfg["epochs"]
     best_val, best_state, patience = np.inf, None, 0
 
@@ -220,11 +252,12 @@ def run_dual(cfg, args):
         model.train()
         logs, parts_log = [], []
         for batch in loader:
-            zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang = \
+            zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang, *ws_b = \
                 [b.to(device) for b in batch]
             if past_noise > 0:
                 cp = cp + torch.randn_like(cp) * past_noise
-            loss, parts, _ = forward(zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang)
+            loss, parts, _ = forward(zp_m, zc_m, zn_m, cp, cf, zwp, zwc, zwn, lang,
+                                     *ws_b)
             opt.zero_grad(); loss.backward(); opt.step()
             if sched:
                 sched.step()
@@ -409,7 +442,7 @@ def main():
         #    오타/미배선 키(예 ln/tok_drop 철자 오류)는 에러 없이 무음 무시된다 —
         #    규격 미달 팔이 규격 팔로 학습·보고되는 최악 경로를 여기서 차단.
         _GRID_KEYS = {"anchor", "camera", "n_tokens", "pool", "d_attn", "heads",
-                      "ln", "tok_drop", "group_drop", "init_std"}
+                      "ln", "tok_drop", "group_drop", "init_std", "wrist_delta"}
         _unk = set(grid_cfg) - _GRID_KEYS
         assert not _unk, (f"grid_obs: 미지원 키 {sorted(_unk)} — "
                           f"허용 키 = {sorted(_GRID_KEYS)} (VERIFY A1: silent no-op 금지)")
@@ -423,6 +456,16 @@ def main():
             ganc.save_tokens = True                   # siglip2: 패치 토큰 반환 활성화
         grid_anchor = (genc["name"], ganc,
                        grid_cfg.get("camera", genc.get("camera", "agentview_rgb")))
+    # ---- W-B Δ̄w-token (grid_obs.wrist_delta=true 일 때만; 없으면 전 경로 no-op = 비트 동형) ----
+    #  측정된 **과거** 손목 변위 1토큰: Δz̄_w(t) = p̄(t) − p̄(t−span), p̄ = wrist pool2 dense
+    #  patch-mean (grid 캐시에서 유도 — 신규 인코딩 0). N2 재척도 w_tok = Δz̄_w·(σ_ref/σ_Δ)
+    #  는 아래 train 통계로 수행, 두 스칼라는 ckpt dict("wrist_delta_std")에 저장(rollout 공용).
+    #  canonical 토큰 순서(VERIFY A2): base → grid → **w_tok 항상 마지막(#10)**.
+    use_wdelta = bool(grid_cfg and grid_cfg.get("wrist_delta", False))
+    if use_wdelta:
+        assert grid_anchor[2] == cfg["data"].get("wrist_camera"), \
+            (f"wrist_delta: grid_obs.camera({grid_anchor[2]}) 가 data.wrist_camera"
+             f"({cfg['data'].get('wrist_camera')}) 와 일치해야 함 — W-B는 손목 변위 토큰")
 
     # ---- C1/F4 fine 채널 (module.f4.enable 있을 때만; 없으면 아래 경로 전부 no-op = 비트 동형) ----
     f4_cfg = m_cfg.get("f4")
@@ -443,7 +486,8 @@ def main():
     if grid_cfg:
         data_obs_anchors = [grid_anchor]
     eps = ds.build_policy_samples(clip, files, stride=cfg["data"].get("stride", 2),
-                                  obs_anchors=data_obs_anchors, f4_anchor=f4_anchor)
+                                  obs_anchors=data_obs_anchors, f4_anchor=f4_anchor,
+                                  obs_delta=use_wdelta)
 
     def stack(ids):
         return tuple(np.concatenate([eps[i][k] for i in ids])
@@ -451,6 +495,11 @@ def main():
 
     Zp_tr, Zc_tr, Zn_tr, Ap_tr, Af_tr, *Wx_tr = stack(tr_ids)
     Zp_va, Zc_va, Zn_va, Ap_va, Af_va, *Wx_va = stack(val_ids)
+
+    # W-B: obs_delta 배열은 dense 뒤 **마지막** — dense 슬라이싱 전에 분리 (off면 no-op)
+    Wd_tr = Wd_va = None
+    if use_wdelta:
+        Wd_tr, Wd_va = Wx_tr.pop(), Wx_va.pop()       # (n, 1024) raw Δz̄_w
 
     # 손목캠 토큰: 로더가 6번째 배열(z_wrist)을 준 경우에만 사용 가능.
     # 6번째 이후는 F3 관측 dense 배열(인코더 순서). n_wrist로 잘라 분리한다.
@@ -474,6 +523,21 @@ def main():
     Zp_va, Zc_va, Zn_va = _v0(Zp_va), _v0(Zc_va), _v0(Zn_va)
     W_va = _v0(W_va)
     Zc_tr0 = _v0(Zc_tr)                               # 클린 통계(x0_std)용 variant0
+
+    # ---- W-B N2 재척도: w_tok = Δz̄_w · (σ_ref/σ_Δ), train 통계 (ckpt 저장 → rollout 공용) ----
+    #  ctx 입구 LN(policy.py)은 flatten 전체 정규화라 토큰 간 상대 스케일을 못 고침(결함 ③
+    #  동일 기전) → 사전 재척도 필수. σ_ref = std(z_cur,train), σ_Δ = std(Δz̄_w,train).
+    wdelta_stats = None
+    if use_wdelta:
+        sigma_delta = float(np.asarray(Wd_tr).std())
+        sigma_ref = float(np.asarray(Zc_tr0).std())
+        wd_scale = sigma_ref / max(sigma_delta, 1e-8)
+        Wd_tr = (np.asarray(Wd_tr) * wd_scale).astype(np.float32)
+        Wd_va = (np.asarray(Wd_va) * wd_scale).astype(np.float32)
+        wdelta_stats = {"sigma_ref": sigma_ref, "sigma_delta": sigma_delta,
+                        "scale": wd_scale}
+        print(f"W-B wrist_delta(N2): σ_ref={sigma_ref:.4f} / σ_Δ={sigma_delta:.4f} "
+              f"→ scale {wd_scale:.2f} (w_tok = canonical 마지막 토큰, A2)")
 
     # 언어 토큰 (멀티태스크 조건화): 에피소드별 지시문 임베딩을 샘플 수만큼 복제
     use_lang = m_cfg.get("lang_token", False)
@@ -553,7 +617,7 @@ def main():
               f"params {sum(p.numel() for p in grid_obs.parameters())/1e6:.3f}M")
 
     # ---- 정책 모델 ----
-    n_tokens = 3 + int(use_lang) + int(use_wrist) + K + Kg
+    n_tokens = 3 + int(use_lang) + int(use_wrist) + K + Kg + int(use_wdelta)
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
                                   latent_dim=p1["model"]["latent_dim"],
                                   action_flat_dim=n_chunk * act_dim).to(device)
@@ -606,10 +670,11 @@ def main():
     L_tr_t = torch.tensor(L_tr) if use_lang else torch.zeros(len(Cp_tr), 0)
     W_tr_t = torch.tensor(W_tr) if use_wrist else torch.zeros(len(Cp_tr), 0)
     Dobs_tr_t = [torch.tensor(d) for d in Dobs_tr]     # F3: 인코더별 dense (없으면 [])
+    Wd_extra = [torch.tensor(Wd_tr)] if use_wdelta else []   # W-B: dense 뒤 마지막 자리
     loader = DataLoader(
         TensorDataset(torch.tensor(Zp_tr), torch.tensor(Zc_tr),
                       torch.tensor(Zn_tr), torch.tensor(Cp_tr),
-                      torch.tensor(Cf_tr), L_tr_t, W_tr_t, *Dobs_tr_t),
+                      torch.tensor(Cf_tr), L_tr_t, W_tr_t, *Dobs_tr_t, *Wd_extra),
         batch_size=t_cfg["batch_size"], shuffle=True)
     val_t = [torch.tensor(x, device=device) for x in (Zp_va, Zc_va, Zn_va)] \
         + [Ae_va.to(device), torch.tensor(Cf_va, device=device)] \
@@ -618,6 +683,8 @@ def main():
         + [torch.tensor(W_va, device=device) if use_wrist
            else torch.zeros(len(Cf_va), 0, device=device)] \
         + [torch.tensor(d, device=device) for d in Dobs_va]
+    if use_wdelta:                                     # W-B: val w_tok (재척도 완료본)
+        val_t.append(torch.tensor(Wd_va, device=device))
     # ★SWAP val: action flow는 x0_src=과거 액션청크 flatten 필요(val 결정화 경로). 기본 flow면 None(미사용).
     Cp_va_t = torch.tensor(Cp_va, device=device) if action_flow else None
     epochs = 3 if args.smoke else t_cfg["epochs"]
@@ -640,6 +707,9 @@ def main():
 
     def forward(zp, zc, zn, aemb, cf, lang, wr, *dobs, cp=None):
         zdim = zp.shape[-1]                           # DeltaAE 경로 폭 (dualconcat 융합=2048; 기존=앵커 폭)
+        wd = None
+        if use_wdelta:                                # W-B: dense 뒤 마지막 자리 = w_tok (재척도됨)
+            dobs, wd = dobs[:-1], dobs[-1]
         # ── S1b 역할분리: 조건 토큰 z_prev/z_cur/(wrist)는 SigLIP2 서브블록[0:cond_dim]만 사용
         #    (의미·언어 경로). g/h/ζ/wm 은 아래에서 항상 융합 z 전체(zp/zc/zn 원본) 사용.
         #    cond_dim=None(cond_anchor 미설정)이면 zp_c=zp … → 아래 전부 no-op(비트 동형).
@@ -661,7 +731,9 @@ def main():
         if grid_cfg:                                  # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
             grid_tok = grid_obs(dobs[0])              # (B, Kg, latent_dim) — 게이트 없음
             toks = toks + [grid_tok[:, k] for k in range(Kg)]
-        toks = torch.stack(toks, dim=1)               # (B, 3~5+K+Kg, 768)
+        if use_wdelta:                                # W-B w_tok — canonical 항상 마지막 (VERIFY A2)
+            toks = toks + [_pad(wd)]
+        toks = torch.stack(toks, dim=1)               # (B, 3~5+K+Kg(+1), 768)
         if is_flow:
             # lat 자리 = CFM 손실, act = FLD(ODE 샘플 디코딩). val은 고정시드로 결정화
             gen = None
@@ -796,6 +868,8 @@ def main():
         if grid_cfg:                                  # F5-H L1: 학습과 동일하게 UNGATED 그리드 토큰 추가
             grid_tok = grid_obs(val_t[7])             # 단일 DINOv3 dense (val_t[7])
             toks = toks + [grid_tok[:, k] for k in range(Kg)]
+        if use_wdelta:                                # W-B w_tok — canonical 마지막 (val_t 마지막 배열)
+            toks = toks + [val_t[-1]]
         gen = torch.Generator(device=device)
         gen.manual_seed(0)
         # concat 융합/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)을 z 폭(2048)의 SigLIP2 서브블록에
@@ -851,11 +925,13 @@ def main():
                "n_val": len(Cf)}
     ckpt_path = Path(os.path.expanduser(t_cfg["checkpoint"]))
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": best_state, "config": cfg, "metrics": metrics,
-                "obs_fusion": obs_fusion.state_dict() if obs_cfg else None,
-                "grid_obs": grid_obs.state_dict() if grid_cfg else None,
-                "f4": best_f4 if f4_on else None},
-               ckpt_path)
+    save_dict = {"state_dict": best_state, "config": cfg, "metrics": metrics,
+                 "obs_fusion": obs_fusion.state_dict() if obs_cfg else None,
+                 "grid_obs": grid_obs.state_dict() if grid_cfg else None,
+                 "f4": best_f4 if f4_on else None}
+    if use_wdelta:      # W-B N2 스칼라 (train/rollout 공용) — off면 키 자체 미생성(dict 불변)
+        save_dict["wrist_delta_std"] = wdelta_stats
+    torch.save(save_dict, ckpt_path)
     print(f"저장: {ckpt_path}")
     if args.tag:
         out = WS / "outputs" / "grid"

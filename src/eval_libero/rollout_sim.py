@@ -89,7 +89,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion, f4, dual,
-     grid_anchor, grid_obs) = load_models(cfg, device)
+     grid_anchor, grid_obs, wdelta) = load_models(cfg, device)
     is_hflow = getattr(ae, "h_mode", "mlp") in ("flow", "residual_flow")   # flow/residual_flow h면 generator 전달 가능
     pol_flow = hasattr(policy, "_x0")               # FlowPolicy만 generator kwarg 수용 (MLPConcat 미수용)
 
@@ -182,11 +182,13 @@ def main():
         def encode(obs):
             return clip.encode_images([Image.fromarray(frame(obs))])["embeds"][0]
 
-        def encode_wrist(obs):
+        def encode_wrist(obs, main_anchor=False):
             img = obs["robot0_eye_in_hand_image"]
             img = img[::-1].copy() if args.flip else img
             # dual: 손목 변위 스트림은 anchor_wrist(예 DINOv3 pooled)로 인코딩. 단일: main clip.
-            enc = clip_wrist if dual else clip
+            # main_anchor=True (W-C wrist_cond_sig): dual 이어도 main clip 으로 인코딩
+            #   — SigLIP2-wrist 조건 토큰용 (DINOv3 zw_hist 는 h 상태 전용으로 병존).
+            enc = clip if (main_anchor or not dual) else clip_wrist
             return enc.encode_images([Image.fromarray(img)])["embeds"][0]
 
         def obs_toks(obs):
@@ -204,9 +206,9 @@ def main():
             ot = obs_fusion(feat)                            # (1,K,768)
             return [ot[:, k] for k in range(ot.size(1))]
 
-        def grid_toks(obs):
-            """F5-H L1: 현재 프레임 DINOv3 patch 격자 → grid_obs → Kg개 UNGATED 토큰.
-            zc 와 동일 프레임(앵커 카메라). 게이트 없음 — 학습과 동일 상시 삽입."""
+        def grid_raw(obs):
+            """grid 앵커 dense patch 토큰 (사영 **전**, (1,P,d)) — grid_toks 의 인코딩부.
+            W-B 가 patch-mean(p̄) 유도에 재사용 → 재계획당 추가 인코딩 0회."""
             _name, anc, cam = grid_anchor
             if wrist_cam and cam == wrist_cam:
                 im = obs["robot0_eye_in_hand_image"]
@@ -214,7 +216,13 @@ def main():
             else:
                 im = frame(obs)
             tok = anc.encode_images([Image.fromarray(im)])["tokens"]  # (1,P,d)
-            gt = grid_obs(torch.tensor(tok, device=device))           # (1,Kg,latent)
+            return torch.tensor(tok, device=device)
+
+        def grid_toks(obs, raw=None):
+            """F5-H L1: 현재 프레임 DINOv3 patch 격자 → grid_obs → Kg개 UNGATED 토큰.
+            zc 와 동일 프레임(앵커 카메라). 게이트 없음 — 학습과 동일 상시 삽입.
+            raw: 사전 인코딩 dense 주입(W-B 경로) — None(기본)이면 종전과 동일 인코딩."""
+            gt = grid_obs(grid_raw(obs) if raw is None else raw)      # (1,Kg,latent)
             return [gt[:, k] for k in range(gt.size(1))]
 
         for ep in range(args.episodes):
@@ -246,6 +254,11 @@ def main():
             # dual: 손목 변위 스트림 히스토리(prev/cur) — main z_hist 와 동일 규약.
             zw_hist = (collections.deque([encode_wrist(obs)], maxlen=span // H + 1)
                        if dual else None)
+            # W-B: 사영 전 wrist pool2 patch-mean p̄ 링버퍼 (**과거 전용** — 미래 무접근).
+            # 재계획마다 append 후 [0] 을 읽으면 p̄(max(t−span,0)) — 학습측
+            # D[max(t−span,0)] 클램프와 동형 (에피소드 초반 워밍업 포함).
+            wd_hist = (collections.deque(maxlen=span // H + 1)
+                       if wdelta is not None else None)
             frames, done, instructed, t = [], False, False, 0
             with torch.no_grad():
                 while t < args.max_steps and not done and not instructed:
@@ -263,8 +276,17 @@ def main():
                                           zp, zwp)                 # concat ζ_past (dc)
                         _pad = lambda x: torch.nn.functional.pad(   # noqa: E731
                             x, (0, dcw - x.shape[-1]))
-                        toks = [_pad(zp), _pad(zc), a_emb, _pad(zwp), _pad(zwc)] \
-                            + ([_pad(lang)] if use_lang else [])
+                        if dual.get("wrist_cond_sig"):
+                            # W-C 결함⑤ 격리: 조건=[zp,zc,a_emb,zw_sig](+lang) — DINOv3
+                            # zw_hist(zwp/zwc)는 encode/decode 의 h 상태 전용으로만 유지.
+                            zw_sig = torch.tensor(
+                                encode_wrist(obs, main_anchor=True)[None],
+                                device=device)
+                            toks = [_pad(zp), _pad(zc), a_emb, _pad(zw_sig)] \
+                                + ([_pad(lang)] if use_lang else [])
+                        else:                         # 기존 dual 6토큰 (비트 동형)
+                            toks = [_pad(zp), _pad(zc), a_emb, _pad(zwp), _pad(zwc)] \
+                                + ([_pad(lang)] if use_lang else [])
                         if locked and pol_flow:      # locked: source=noise x0 재시딩(그 외 소스는 RNG 무소비)
                             zeta = policy(torch.stack(toks, dim=1), generator=flow_gen())
                         else:                        # fresh/walk: 기존 호출 그대로 (비트 동형)
@@ -287,7 +309,15 @@ def main():
                         if obs_fusion is not None:       # F3: 관측 토큰 K개를 열 끝에 추가
                             toks = toks + obs_toks(obs)
                         if grid_obs is not None:         # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
-                            toks = toks + grid_toks(obs)
+                            if wd_hist is not None:      # W-B: dense 1회 인코딩을 grid/w_tok 공유
+                                raw = grid_raw(obs)
+                                pmean = raw.mean(dim=1)          # p̄(t) (1, d) 사영 전
+                                wd_hist.append(pmean)            # append 후 [0]=p̄(max(t−span,0))
+                                w_tok = (pmean - wd_hist[0]) * wdelta["scale"]   # N2 재척도
+                                toks = toks + grid_toks(obs, raw=raw)
+                                toks = toks + [w_tok]    # W-B w_tok #10 — canonical 마지막 (A2)
+                            else:
+                                toks = toks + grid_toks(obs)
                         # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
                         # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
                         # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)

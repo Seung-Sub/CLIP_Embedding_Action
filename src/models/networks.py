@@ -296,10 +296,22 @@ class DualDeltaAE(nn.Module):
       align_main/wrist: ζ_·≈Δz_· (각 카메라 잠재공간, MSE+0.5·(1−cos) 또는 L1)
       recon/cycle     : 두 변위를 함께 디코딩한 단일 액션청크에 대한 L1 (VITA 동형).
     이 클래스는 dual_stream 경로에서만 인스턴스화된다 — 위 단일 DeltaAE는 무변경
-    (비트 동형). h_mode="mlp" 속성은 rollout/phase2의 getattr(ae,"h_mode") 호환용."""
+    (비트 동형). h_mode="mlp" 속성은 rollout/phase2의 getattr(ae,"h_mode") 호환용.
+
+    stream_standardize (W-C **N3**, DESIGN_wrist_fusion_unified_v1 §2.3 — 결함 ①·③ 수리):
+      Δz 스케일 6.5× 불일치(main 0.1346 / wrist 0.0208)를 per-stream z-score로 해소.
+      True면 dz_std_main/dz_std_wrist buffer 2개를 등록(학습 시작 시 train std 주입,
+      state_dict에 자동 저장)하고 ζ **통화 자체가 표준화 공간**이 된다:
+        • align 타깃 = Δz_·/σ_·  → g/encode 출력은 표준화 공간 (encode 내부 변경 불요)
+        • recon 의 h 입력 = [Δz_m/σ_m ; Δz_w/σ_w] → h/decode 는 표준화 공간을 소비
+          (h 입구 단일 LN(결함 ③)이 균등 분산 블록을 받음)
+        • 액션이 출력이라 ζ→Δz 역변환은 어디에도 불요 — 단 **raw Δz를 decode/h에
+          직접 넣는 호출부는 반드시 std_dz()를 경유**해야 함 (train_phase1 평가부).
+      False(기본)면 buffer 미생성 + std_dz 항등 → 기존 경로 비트 동형."""
 
     def __init__(self, action_dim, n_chunk, dim_main, dim_wrist, hidden=512,
-                 layers=4, dropout=0.0, state_cond=True):
+                 layers=4, dropout=0.0, state_cond=True,
+                 stream_standardize=False):
         super().__init__()
         self.dim_main = int(dim_main)
         self.dim_wrist = int(dim_wrist)
@@ -311,6 +323,20 @@ class DualDeltaAE(nn.Module):
                                     dropout, state_cond)
         self.h = ChunkDecoder(action_dim, n_chunk, self.dim_cat, hidden, layers,
                               dropout, state_cond)
+        # N3: off(기본)면 buffer 자체를 만들지 않음 → state_dict 키 불변(비트 동형).
+        self.stream_standardize = bool(stream_standardize)
+        if self.stream_standardize:
+            self.register_buffer("dz_std_main", torch.ones(1))
+            self.register_buffer("dz_std_wrist", torch.ones(1))
+
+    def std_dz(self, dz_main, dz_wrist):
+        """raw Δz → per-stream z-score 공간 (N3). off면 항등(입력 그대로 반환).
+
+        ζ 통화 = 표준화 공간: align 타깃·h(recon) 입력이 이 함수를 거치므로
+        g/encode 출력과 phase2 ζ̂·decode 입력은 전부 같은 공간 — 역변환 불요."""
+        if not self.stream_standardize:
+            return dz_main, dz_wrist
+        return dz_main / self.dz_std_main, dz_wrist / self.dz_std_wrist
 
     def encode(self, chunk, z_main, z_wrist):
         """액션청크 → concat 변위 ζ=[ζ_main ; ζ_wrist] (dim_cat). phase2 flow 타깃."""
@@ -332,10 +358,11 @@ class DualDeltaAE(nn.Module):
                align_type="mse_cos"):
         gm = self.g_main(chunk, z_main)
         gw = self.g_wrist(chunk, z_wrist)
-        l_am = self._align(gm, dz_main, align_type)
-        l_aw = self._align(gw, dz_wrist, align_type)
+        dzm, dzw = self.std_dz(dz_main, dz_wrist)    # N3: off면 항등 → 기존 식 그대로
+        l_am = self._align(gm, dzm, align_type)
+        l_aw = self._align(gw, dzw, align_type)
         zt_cat = torch.cat([z_main, z_wrist], dim=1)
-        ahat = self.h(torch.cat([dz_main, dz_wrist], dim=1), zt_cat)   # real Δz → a
+        ahat = self.h(torch.cat([dzm, dzw], dim=1), zt_cat)           # real Δz → a
         acyc = self.h(torch.cat([gm, gw], dim=1), zt_cat)             # 왕복 (grad→g)
         l_recon = nn.functional.l1_loss(ahat, chunk)
         l_cycle = nn.functional.l1_loss(acyc, chunk)
@@ -343,3 +370,21 @@ class DualDeltaAE(nn.Module):
                  + w["recon"] * l_recon + w["cycle"] * l_cycle)
         return total, {"align_main": l_am.item(), "align_wrist": l_aw.item(),
                        "recon": l_recon.item(), "cycle": l_cycle.item()}
+
+    def loss_terms(self, chunk, dz_main, dz_wrist, z_main, z_wrist,
+                   align_type="mse_cos"):
+        """항별 손실 **텐서** dict (가중 전) — 결함 ④ grad-norm 로깅 전용.
+
+        losses()와 동일 수식(표준화 포함)이나 총합/스칼라화를 하지 않아 호출측이
+        torch.autograd.grad 로 항별 grad-norm 을 뽑을 수 있다. 학습 경로는 여전히
+        losses()만 사용 — 이 메서드는 W-C 로깅에서만 호출(기존 경로 무영향)."""
+        gm = self.g_main(chunk, z_main)
+        gw = self.g_wrist(chunk, z_wrist)
+        dzm, dzw = self.std_dz(dz_main, dz_wrist)
+        zt_cat = torch.cat([z_main, z_wrist], dim=1)
+        ahat = self.h(torch.cat([dzm, dzw], dim=1), zt_cat)
+        acyc = self.h(torch.cat([gm, gw], dim=1), zt_cat)
+        return {"align_main": self._align(gm, dzm, align_type),
+                "align_wrist": self._align(gw, dzw, align_type),
+                "recon": nn.functional.l1_loss(ahat, chunk),
+                "cycle": nn.functional.l1_loss(acyc, chunk)}

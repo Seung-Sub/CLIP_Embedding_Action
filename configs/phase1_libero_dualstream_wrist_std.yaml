@@ -1,0 +1,63 @@
+# Phase 1 (LIBERO) — W-C "dual 표준화 재판" (WristCond-v1 ABL-2): dual-stream + N3 수리.
+# ══════════════════════════════════════════════════════════════════════════
+# phase1_libero_dualstream_wrist.yaml 의 결함 수리판 (DESIGN_wrist_fusion_unified_v1 §0/§2.3/§3.1):
+#   • N3 (결함 ①·③): model.stream_standardize=true — Δz 스케일 6.5×(main 0.1346 /
+#     wrist 0.0208) 불일치를 per-stream z-score 로 수리. dz_std_main/dz_std_wrist buffer
+#     2개가 train std 로 주입·ckpt(state_dict) 저장 → align 타깃·h 입력 = 표준화 공간
+#     (h 입구 단일 LN 이 균등 분산 블록을 받음). 학습 파라미터 +0 (buffer 만).
+#   • 결함 ④: stream_standardize 시 항별(align_m/align_w/recon/cycle) grad-norm 을
+#     epoch 마다 wandb/stdout 로깅 — "align 수렴 착시" 재발 방지.
+#   구조/손실/데이터는 원판과 동일 (변경 = 표준화 번들 하나, 팔당 변경 하나 원칙).
+# W-C phase2 짝: configs/phase2_libero_dualstream_wrist_std_noaug.yaml
+# [AMEND A5] phase1 공유=pairing 은 W-A/W-B 한정 — W-C 승리(F1) 시 dual phase1
+#   재학습 1회를 확증(50roll×3seed) 요건에 포함할 것.
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb        # dual 손목 변위 스트림 (필수)
+  chunk_sec: 0.8                       # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256   # cache_key로 main/wrist 자동 분리
+
+anchor:                                # main (agentview) — 단일 SigLIP2 (효과 격리)
+  name: siglip2
+  model_dir: google/siglip2-large-patch16-256
+  projection: joint
+  normalize: false                     # NATIVE-BEST (large256 phase1과 동일 → 캐시 재사용)
+
+anchor_wrist:                          # wrist — DINOv3 pooled CLS (변위 스트림 상태; 조건 토큰 아님)
+  name: dinov3
+  model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+  pooled: cls
+  normalize: true
+
+model:
+  latent_dim: 1024                     # (참고용; dual은 앵커 dim에서 자동 도출)
+  hidden: 512
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+  dual_stream: true                    # dual-stream 경로 활성 (없으면 단일 = 비트 동형)
+  stream_standardize: true             # ★W-C N3: per-stream Δz z-score (dz_std buffer 2개)
+
+loss:
+  align: 0.5                           # align_main + align_wrist 각각에 적용 (표준화 공간)
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/phase1_libero_dualstream_wrist_std.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase1_libero_dualstream_wrist_std}
