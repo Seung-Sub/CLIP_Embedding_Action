@@ -52,6 +52,32 @@ def _pad_to(t, d):
     return t if t.shape[-1] == d else torch.nn.functional.pad(t, (0, d - t.shape[-1]))
 
 
+def _validate_patch_obs_cfg(m_cfg):
+    """P-B LangSelPool config 가드 — VERIFY A1(무음 no-op 금지) 상속, _GRID_KEYS 규약 동형.
+
+    patch_obs 블록이 없으면 None 반환(전 경로 no-op = 기존 config 비트 동형).
+    있으면 미지원 키·전제조건을 loud-fail 로 검사하고 dict 를 반환.
+    모듈-레벨 함수인 이유: 스모크(scratchpad/test_pb_langselpool_smoke.py)가 데이터/
+    모델 로드 없이 가드 자체를 기능 검증(bogus 키 → AssertionError)하기 위함."""
+    patch_cfg = m_cfg.get("patch_obs")
+    if not patch_cfg:
+        return None
+    _PATCH_KEYS = {"anchor", "camera", "n_tokens", "d_attn", "heads",
+                   "tok_drop", "group_drop"}
+    _unk = set(patch_cfg) - _PATCH_KEYS
+    assert not _unk, (f"patch_obs: 미지원 키 {sorted(_unk)} — "
+                      f"허용 키 = {sorted(_PATCH_KEYS)} (VERIFY A1: silent no-op 금지)")
+    assert m_cfg.get("name") == "flow", "patch_obs: flow 정책 전제(조건 토큰 삽입)"
+    assert m_cfg.get("lang_token"), \
+        "patch_obs: 텍스트-조건 풀링은 지시문 임베딩 필요 → lang_token=true 전제"
+    assert not m_cfg.get("obs"), "patch_obs 와 module.obs 는 동시 사용 불가"
+    assert not m_cfg.get("grid_obs"), "patch_obs 와 module.grid_obs 는 동시 사용 불가"
+    assert not (m_cfg.get("f4") and m_cfg["f4"].get("enable")), \
+        "patch_obs 와 module.f4 는 동시 사용 불가"
+    assert not m_cfg.get("dual_stream"), "patch_obs: dual_stream 미지원"
+    return patch_cfg
+
+
 def run_dual(cfg, args):
     """Phase2 dual-stream 정책 학습 (module.dual_stream=true 전용).
 
@@ -379,7 +405,11 @@ def main():
                  sigmoid_bias0=p1["model"].get("sigmoid_bias0", -5.5),
                  align_block=p1["model"].get("align_block"),
                  h_mode=p1["model"].get("h_mode", "mlp"),
-                 h_flow_steps=p1["model"].get("h_flow_steps", 5)).to(device)
+                 h_flow_steps=p1["model"].get("h_flow_steps", 5),
+                 # capacity sweep(PREREG_capacity_sweep): g/h 폭 독립 오버라이드 —
+                 # 구 ckpt 는 키 부재 → None = hidden 그대로 (비트 동형).
+                 hidden_g=p1["model"].get("hidden_g"),
+                 hidden_h=p1["model"].get("hidden_h")).to(device)
     ae.load_state_dict(ck["state_dict"])
     ae.eval()
     for p in ae.parameters():
@@ -456,6 +486,19 @@ def main():
             ganc.save_tokens = True                   # siglip2: 패치 토큰 반환 활성화
         grid_anchor = (genc["name"], ganc,
                        grid_cfg.get("camera", genc.get("camera", "agentview_rgb")))
+    # ---- P-B LangSelPool (module.patch_obs 있을 때만; 없으면 아래 경로 전부 no-op = 비트 동형) ----
+    #  텍스트-조건 patch 풀링(OTTER-style): lang 쿼리 × dense patch cross-attn → Kp개
+    #  UNGATED 관측 토큰 (DESIGN_patch_policy_attention_v1 §4, B1=large256-single 기질).
+    #  데이터는 grid_obs 와 동일하게 obs dense 배관(data_obs_anchors 맨 앞 1개) 재사용.
+    patch_cfg = _validate_patch_obs_cfg(m_cfg)        # loud-fail 가드 (VERIFY A1 상속)
+    patch_anchor = None
+    if patch_cfg:
+        penc = patch_cfg["anchor"]
+        panc = get_anchor({"anchor": penc})
+        if penc["name"] == "siglip2":
+            panc.save_tokens = True                   # siglip2: 패치 토큰 반환 활성화
+        patch_anchor = (penc["name"], panc,
+                        patch_cfg.get("camera", penc.get("camera", "agentview_rgb")))
     # ---- W-B Δ̄w-token (grid_obs.wrist_delta=true 일 때만; 없으면 전 경로 no-op = 비트 동형) ----
     #  측정된 **과거** 손목 변위 1토큰: Δz̄_w(t) = p̄(t) − p̄(t−span), p̄ = wrist pool2 dense
     #  patch-mean (grid 캐시에서 유도 — 신규 인코딩 0). N2 재척도 w_tok = Δz̄_w·(σ_ref/σ_Δ)
@@ -485,6 +528,8 @@ def main():
     data_obs_anchors = obs_anchors
     if grid_cfg:
         data_obs_anchors = [grid_anchor]
+    if patch_cfg:                                     # P-B: 단일 dense 앵커 (grid 와 상호배타)
+        data_obs_anchors = [patch_anchor]
     eps = ds.build_policy_samples(clip, files, stride=cfg["data"].get("stride", 2),
                                   obs_anchors=data_obs_anchors, f4_anchor=f4_anchor,
                                   obs_delta=use_wdelta)
@@ -510,9 +555,9 @@ def main():
     W_tr = Wx_tr[0] if use_wrist else None
     W_va = Wx_va[0] if use_wrist else None
     # 인코더별 dense [N,P,d]. obs=F3 관측 인코더들 / f4=단일 patch ΔF (맨 뒤 1개) /
-    # grid_obs=단일 DINOv3 patch 격자 (맨 앞 1개).
-    Dobs_tr = Wx_tr[n_wrist:] if (obs_cfg or f4_on or grid_cfg) else []
-    Dobs_va = Wx_va[n_wrist:] if (obs_cfg or f4_on or grid_cfg) else []
+    # grid_obs·patch_obs=단일 dense patch 격자 (맨 앞 1개).
+    Dobs_tr = Wx_tr[n_wrist:] if (obs_cfg or f4_on or grid_cfg or patch_cfg) else []
+    Dobs_va = Wx_va[n_wrist:] if (obs_cfg or f4_on or grid_cfg or patch_cfg) else []
 
     # ---- Exp2 both-aug: variant 뱅크 처리 (data.augment on일 때만) ----
     # build_policy_samples가 (N, M, D) 뱅크를 주면: val/eval은 항상 variant0(클린),
@@ -616,8 +661,30 @@ def main():
               f"init_std={grid_cfg.get('init_std')}, "
               f"params {sum(p.numel() for p in grid_obs.parameters())/1e6:.3f}M")
 
+    # ---- P-B LangSelPool 모듈 (patch_obs일 때만; Kp개 UNGATED 토큰을 정책 입력열 끝에 추가) ----
+    patch_obs_mod, Kp = None, 0
+    if patch_cfg:
+        from models.obs_fusion import LangSelPool
+        patch_obs_mod = LangSelPool(
+            patch_dim=Dobs_tr[0].shape[-1],           # dense patch 폭 (DINOv3=1024)
+            text_dim=L_tr.shape[1],                   # lang 임베딩 폭 (large256=1024)
+            out_dim=p1["model"]["latent_dim"],
+            n_patch=Dobs_tr[0].shape[-2],             # pool_to=8 → 64 (pos_emb 격자)
+            n_tokens=patch_cfg.get("n_tokens", 1),    # B1 = +1 조건 토큰 (기본)
+            d_attn=patch_cfg.get("d_attn", 768),
+            heads=patch_cfg.get("heads", 8),
+            tok_drop=patch_cfg.get("tok_drop", 0.1),
+            group_drop=patch_cfg.get("group_drop", 0.1)).to(device)
+        Kp = patch_obs_mod.n_tokens
+        print(f"patch_obs(LangSelPool): K={Kp} tokens, kv {Dobs_tr[0].shape[-2]}×"
+              f"{Dobs_tr[0].shape[-1]} + pos_emb, text_q {L_tr.shape[1]}→"
+              f"{patch_cfg.get('d_attn', 768)}, out latent {p1['model']['latent_dim']}, "
+              f"UNGATED, tok_drop={patch_obs_mod.tok_drop}, "
+              f"group_drop={patch_obs_mod.group_drop}, "
+              f"params {sum(p.numel() for p in patch_obs_mod.parameters())/1e6:.3f}M")
+
     # ---- 정책 모델 ----
-    n_tokens = 3 + int(use_lang) + int(use_wrist) + K + Kg + int(use_wdelta)
+    n_tokens = 3 + int(use_lang) + int(use_wrist) + K + Kg + Kp + int(use_wdelta)
     model = build_policy_from_cfg(m_cfg, n_tokens=n_tokens,
                                   latent_dim=p1["model"]["latent_dim"],
                                   action_flat_dim=n_chunk * act_dim).to(device)
@@ -663,6 +730,7 @@ def main():
         list(model.parameters())
         + (list(obs_fusion.parameters()) if obs_cfg else [])
         + (list(grid_obs.parameters()) if grid_cfg else [])
+        + (list(patch_obs_mod.parameters()) if patch_cfg else [])
         + (list(f4.parameters()) if f4_on else []),
         lr=t_cfg["lr"],
         betas=tuple(t_cfg.get("adam_betas", (0.9, 0.999))))
@@ -689,6 +757,7 @@ def main():
     Cp_va_t = torch.tensor(Cp_va, device=device) if action_flow else None
     epochs = 3 if args.smoke else t_cfg["epochs"]
     best_val, best_state, best_f4, patience = np.inf, None, None, 0
+    best_patch = None                                 # P-B: best-epoch LangSelPool state
 
     sched = None
     if t_cfg.get("scheduler") == "cosine":
@@ -731,6 +800,9 @@ def main():
         if grid_cfg:                                  # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
             grid_tok = grid_obs(dobs[0])              # (B, Kg, latent_dim) — 게이트 없음
             toks = toks + [grid_tok[:, k] for k in range(Kg)]
+        if patch_cfg:                                 # P-B: 언어-선택 patch 토큰 Kp개 — canonical 마지막
+            patch_tok = patch_obs_mod(dobs[0], lang)  # (B, Kp, latent_dim) — UNGATED, lang 인과 하류
+            toks = toks + [patch_tok[:, k] for k in range(Kp)]
         if use_wdelta:                                # W-B w_tok — canonical 항상 마지막 (VERIFY A2)
             toks = toks + [_pad(wd)]
         toks = torch.stack(toks, dim=1)               # (B, 3~5+K+Kg(+1), 768)
@@ -798,6 +870,8 @@ def main():
             obs_fusion.train()
         if grid_cfg:
             grid_obs.train()
+        if patch_cfg:
+            patch_obs_mod.train()
         if f4_on:
             f4.train()
         logs, parts_log = [], []
@@ -813,17 +887,38 @@ def main():
             obs_fusion.eval()
         if grid_cfg:
             grid_obs.eval()
+        if patch_cfg:
+            patch_obs_mod.eval()
         if f4_on:
             f4.eval()
         with torch.no_grad():
             val_loss, val_parts = forward(*val_t, cp=Cp_va_t)
         val_loss = val_loss.item()
+        # ---- P-B 필수 로깅 (설계 §4.2/§7.2-P3): attention entropy vs ln(P) + ‖token‖ ----
+        #  entropy≈ln(P) 지속 = uniform 붕괴(선택 실재성 실패 탐지), ‖token‖ = 사용량 프록시.
+        patch_log = {}
+        if patch_cfg:
+            with torch.no_grad():
+                _n = min(512, len(val_t[7]))
+                _pt, _aw = patch_obs_mod(val_t[7][:_n], val_t[5][:_n],
+                                         return_attn=True)   # _aw (B, heads, Kp, P)
+                _p = _aw.clamp_min(1e-12)
+                _ent = -(_p * _p.log()).sum(-1)               # (B, heads, Kp)
+            patch_log = {"val/patch_attn_entropy": float(_ent.mean()),
+                         "val/patch_attn_entropy_min_head": float(
+                             _ent.mean(dim=(0, 2)).min()),
+                         "val/patch_attn_entropy_uniform": float(
+                             np.log(_aw.shape[-1])),
+                         "val/patch_tok_norm": float(_pt.norm(dim=-1).mean())}
         if val_loss < best_val - 1e-5:
             best_val, patience = val_loss, 0
             best_state = {k: v.detach().cpu().clone()
                           for k, v in model.state_dict().items()}
             best_f4 = ({k: v.detach().cpu().clone()
                         for k, v in f4.state_dict().items()} if f4_on else None)
+            best_patch = ({k: v.detach().cpu().clone()
+                           for k, v in patch_obs_mod.state_dict().items()}
+                          if patch_cfg else None)
         else:
             patience += 1
         if wb:
@@ -831,10 +926,16 @@ def main():
                     "val/total": val_loss,
                     **{f"train/{k}": np.mean([x[k] for x in parts_log])
                        for k in parts_log[0]},
-                    **{f"val/{k}": v for k, v in val_parts.items()}})
+                    **{f"val/{k}": v for k, v in val_parts.items()},
+                    **patch_log})
         if ep % 10 == 0 or ep == epochs - 1:
             print(f"ep {ep:3d} | train {np.mean(logs):.4f} | val {val_loss:.4f} "
                   f"({val_parts}) | patience {patience}")
+            if patch_log:
+                print(f"      patch_attn entropy {patch_log['val/patch_attn_entropy']:.3f} "
+                      f"(uniform ln P = {patch_log['val/patch_attn_entropy_uniform']:.3f}, "
+                      f"min-head {patch_log['val/patch_attn_entropy_min_head']:.3f}) | "
+                      f"‖token‖ {patch_log['val/patch_tok_norm']:.3f}")
         if patience >= t_cfg["early_stop_patience"]:
             print(f"early stop @ ep {ep}")
             break
@@ -842,6 +943,8 @@ def main():
     model.load_state_dict(best_state)
     if f4_on and best_f4 is not None:
         f4.load_state_dict(best_f4)
+    if patch_cfg and best_patch is not None:          # P-B: 정책과 동일 best-epoch 로 복원
+        patch_obs_mod.load_state_dict(best_patch)
 
     # ---- 평가 ----
     model.eval()
@@ -849,6 +952,8 @@ def main():
         obs_fusion.eval()
     if grid_cfg:
         grid_obs.eval()
+    if patch_cfg:
+        patch_obs_mod.eval()
     if f4_on:
         f4.eval()
     with torch.no_grad():
@@ -868,6 +973,9 @@ def main():
         if grid_cfg:                                  # F5-H L1: 학습과 동일하게 UNGATED 그리드 토큰 추가
             grid_tok = grid_obs(val_t[7])             # 단일 DINOv3 dense (val_t[7])
             toks = toks + [grid_tok[:, k] for k in range(Kg)]
+        if patch_cfg:                                 # P-B: 학습과 동일하게 언어-선택 patch 토큰 추가
+            patch_tok = patch_obs_mod(val_t[7], val_t[5])   # dense (val_t[7]) × lang (val_t[5])
+            toks = toks + [patch_tok[:, k] for k in range(Kp)]
         if use_wdelta:                                # W-B w_tok — canonical 마지막 (val_t 마지막 배열)
             toks = toks + [val_t[-1]]
         gen = torch.Generator(device=device)
@@ -931,6 +1039,8 @@ def main():
                  "f4": best_f4 if f4_on else None}
     if use_wdelta:      # W-B N2 스칼라 (train/rollout 공용) — off면 키 자체 미생성(dict 불변)
         save_dict["wrist_delta_std"] = wdelta_stats
+    if patch_cfg:       # P-B LangSelPool best state — off면 키 자체 미생성(dict 불변)
+        save_dict["patch_obs"] = patch_obs_mod.state_dict()
     torch.save(save_dict, ckpt_path)
     print(f"저장: {ckpt_path}")
     if args.tag:

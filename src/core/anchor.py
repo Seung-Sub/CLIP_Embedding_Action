@@ -137,7 +137,12 @@ class Siglip2Anchor(BaseAnchor):
             src, dtype=torch.float16 if self.device == "cuda" else torch.float32
         ).to(self.device).eval()
         self.processor = AutoProcessor.from_pretrained(src)
-        self.dim = self.model.config.vision_config.hidden_size    # 1152
+        self.dim = self.model.config.vision_config.hidden_size    # so400m=1152 / large256=1024
+        # 롤아웃 patch_dim 함정 수리 (DESIGN_WD_WAprime_v1 §3.2 사전등록): 클래스 상수
+        # patch_dim=1152 는 so400m 전용 — large256 실폭은 1024 라 rollout_dataset 이
+        # ganc.patch_dim 으로 모듈을 재구성할 때 ckpt 와 shape 불일치(학습만 통과하고
+        # 롤아웃에서 죽는 함정). 인스턴스 실폭으로 덮어씀 (so400m 은 1152=1152 no-op).
+        self.patch_dim = self.dim
         self.dim_text = self.dim
         self.save_tokens = False                  # E3에서 True로 (패치 토큰 반환)
 

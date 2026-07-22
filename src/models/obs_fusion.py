@@ -171,3 +171,81 @@ class GridObs(nn.Module):
         kv = self.ln(self.kv_proj(kv))
         o, _ = self.attn(q, kv, kv)
         return self._drop(self.proj(o))                                  # (B,K,out_dim)
+
+
+class LangSelPool(nn.Module):
+    """P-B — 텍스트-조건 patch 풀링 (OTTER-style, DESIGN_patch_policy_attention_v1 §4).
+
+    지시문(lang) 임베딩이 dense patch 격자를 **질의**해 "이 태스크에 유관한 기하"
+    K개 토큰을 추출, phase2 flow 조건 토큰열 끝에 **UNGATED 상시 삽입**한다(IV4).
+    C1/C2(f4)와 같은 텍스트-쿼리 cross-attn 연산이지만 삽입점이 다르다 — 타깃/코드
+    측(gated, ∂L_act/∂α≡0)이 아니라 **관측/조건화 측**(태스크 손실 직통, 게이트 없음).
+
+    F3 결함-수정 체크리스트(설계 §2.3) 전항 반영:
+      • kv-LN: kv = ln_kv(kv_proj(patch) + pos_emb) — f4.py _readout 배선 동형(사내 검증).
+      • init: 모든 학습 Linear weight N(0, 0.02²)·bias 0, pos_emb/query_offset std 0.02
+        (F3 의 query randn std 1.0 결함 수리; MHA 내부는 torch 기본 = f4 동형).
+      • pos-emb: kv측 학습 2D 격자 임베딩 (P, d_attn) — attention 풀링은 위치 필수.
+      • dropout 2단(학습시만): per-token zero-drop + group-drop(K개 전부 0 — 언어-only
+        경로 보존 강제, modality-dropout 관례). GridObs._drop 규약 동일.
+    쿼리 = W_q·L2norm(lang) + query_offset_k — lang L2-norm 은 §4.4 스케일-지배 방지.
+    출력 = out(ln_out(attn_out)) (B, K, out_dim) — 정책 잠재폭 사영.
+
+    forward(..., return_attn=True) 는 (tokens, attn_weights(B,heads,K,P)) 반환 —
+    설계 §4.2 필수 로깅(attention entropy·‖token‖)용. 기본 False 는 tokens만(빠름).
+    이 클래스 추가는 기존 모듈(ObsFusion/GridObs)의 코드·RNG 소비·state_dict 에 어떤
+    영향도 없음 (byte-identity: patch_obs 미설정 경로는 이 클래스를 생성하지 않는다).
+    """
+
+    def __init__(self, patch_dim, text_dim, out_dim, n_patch, n_tokens=1,
+                 d_attn=768, heads=8, tok_drop=0.1, group_drop=0.1):
+        super().__init__()
+        self.n_tokens = int(n_tokens)
+        self.n_patch = int(n_patch)
+        self.out_dim = out_dim
+        self.tok_drop = float(tok_drop)
+        self.group_drop = float(group_drop)
+        assert 0.0 <= self.tok_drop < 1.0 and 0.0 <= self.group_drop < 1.0, \
+            (tok_drop, group_drop)
+        self.kv_proj = nn.Linear(patch_dim, d_attn)
+        self.pos_emb = nn.Parameter(torch.zeros(self.n_patch, d_attn))
+        self.ln_kv = nn.LayerNorm(d_attn)
+        self.text_q = nn.Linear(text_dim, d_attn)
+        self.query_offset = nn.Parameter(torch.zeros(self.n_tokens, d_attn))
+        self.attn = nn.MultiheadAttention(d_attn, heads, batch_first=True)
+        self.ln_out = nn.LayerNorm(d_attn)
+        self.out = nn.Linear(d_attn, out_dim)
+        # 설계 규격 init (§2.3): Linear weight std 0.02 / bias 0, 임베딩 std 0.02.
+        for lin in (self.kv_proj, self.text_q, self.out):
+            nn.init.normal_(lin.weight, std=0.02)
+            nn.init.zeros_(lin.bias)
+        nn.init.normal_(self.pos_emb, std=0.02)
+        nn.init.normal_(self.query_offset, std=0.02)
+
+    def _drop(self, x):                                    # (B, K, out_dim) — 학습시만 활성
+        if not self.training or (self.tok_drop <= 0 and self.group_drop <= 0):
+            return x                                       # eval/off = 항등
+        B = x.shape[0]
+        if self.tok_drop > 0:                              # ① per-token zero-drop (독립)
+            keep = (torch.rand(B, self.n_tokens, 1, device=x.device) >= self.tok_drop)
+            x = x * keep.to(x.dtype)
+        if self.group_drop > 0:                            # ② group-drop: K개 전부 0 (언어-only 경로)
+            keep = (torch.rand(B, 1, 1, device=x.device) >= self.group_drop)
+            x = x * keep.to(x.dtype)
+        return x
+
+    def forward(self, patches, lang, return_attn=False):
+        """patches (B, P, patch_dim) + lang (B, text_dim) → (B, K, out_dim).
+
+        return_attn=True 면 (tokens, weights(B, heads, K, P)) — entropy/맵 로깅용."""
+        import torch.nn.functional as F
+        B, P, _D = patches.shape
+        assert P == self.n_patch, \
+            f"patch 수 {P} != pos_emb {self.n_patch} (pool_to/캐시 키 불일치?)"
+        kv = self.ln_kv(self.kv_proj(patches) + self.pos_emb.unsqueeze(0))
+        q = self.text_q(F.normalize(lang, dim=-1)).unsqueeze(1) \
+            + self.query_offset.unsqueeze(0)               # (B, K, d_attn)
+        o, w = self.attn(q, kv, kv, need_weights=return_attn,
+                         average_attn_weights=False)
+        tok = self._drop(self.out(self.ln_out(o)))         # (B, K, out_dim) — UNGATED
+        return (tok, w) if return_attn else tok

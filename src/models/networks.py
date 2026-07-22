@@ -155,7 +155,7 @@ class DeltaAE(nn.Module):
                  decoder_state_cond=None, encoder_state_cond=None,
                  align_mode="dz", contrast_w=0.0, contrast_loss="infonce",
                  contrast_head=False, sigmoid_bias0=-5.5, align_block=None,
-                 h_mode="mlp", h_flow_steps=5):
+                 h_mode="mlp", h_flow_steps=5, hidden_g=None, hidden_h=None):
         """decoder_state_cond/encoder_state_cond: h/g 각각 독립적으로 상태조건을
         끄기 위한 오버라이드. None이면 state_cond와 동일(기존 동작 유지).
           decoder_state_cond=False (C0) : h가 z_t 없이도 되는지 (실측: 거의 무손실)
@@ -164,11 +164,17 @@ class DeltaAE(nn.Module):
 
         align_mode (C8/HY03 언어정렬): dz(기준·기본) / direct(InfoNCE→모션문장) /
         hybrid(dz + λc·InfoNCE). direct/hybrid도 recon·cycle 유지. 기본 dz에선 아래
-        contrastive 파라미터를 만들지 않아 state_dict 불변(기존 CLIP-768 경로 비트 동형)."""
+        contrastive 파라미터를 만들지 않아 state_dict 불변(기존 CLIP-768 경로 비트 동형).
+
+        hidden_g/hidden_h (capacity sweep, docs/PREREG_capacity_sweep.md): g(인코더)·
+        h(디코더)의 hidden 폭을 각각 독립 오버라이드. None(기본)이면 hidden 그대로 —
+        모듈 생성 인자·순서 불변이라 기존 config/ckpt 와 비트 동형(byte-identity)."""
         super().__init__()
         enc_cond = state_cond if encoder_state_cond is None else encoder_state_cond
         dec_cond = state_cond if decoder_state_cond is None else decoder_state_cond
-        self.g = ChunkEncoder(action_dim, latent_dim, hidden, layers,
+        hg = hidden if hidden_g is None else int(hidden_g)   # capacity sweep g 폭
+        hh = hidden if hidden_h is None else int(hidden_h)   # capacity sweep h 폭
+        self.g = ChunkEncoder(action_dim, latent_dim, hg, layers,
                               dropout, enc_cond)
         # h_mode: mlp(기본, 결정론 조건평균) | flow(S2, 조건부 flow-matching 디코더 — 미세 다봉성)
         #   | residual_flow(콜리그 M7/Q2 동형: MLP 조건평균 + 잔차 flow — 평균이 결정론 앵커,
@@ -177,13 +183,13 @@ class DeltaAE(nn.Module):
         assert h_mode in ("mlp", "flow", "residual_flow"), h_mode
         self.h_mode = h_mode
         if h_mode == "flow":
-            self.h = ChunkFlowDecoder(action_dim, n_chunk, latent_dim, hidden,
+            self.h = ChunkFlowDecoder(action_dim, n_chunk, latent_dim, hh,
                                       layers, dropout, dec_cond, steps=h_flow_steps)
         elif h_mode == "residual_flow":
-            self.h = ResidualFlowDecoder(action_dim, n_chunk, latent_dim, hidden,
+            self.h = ResidualFlowDecoder(action_dim, n_chunk, latent_dim, hh,
                                          layers, dropout, dec_cond, steps=h_flow_steps)
         else:
-            self.h = ChunkDecoder(action_dim, n_chunk, latent_dim, hidden,
+            self.h = ChunkDecoder(action_dim, n_chunk, latent_dim, hh,
                                   layers, dropout, dec_cond)
         assert align_mode in ("dz", "direct", "hybrid"), align_mode
         self.align_mode = align_mode

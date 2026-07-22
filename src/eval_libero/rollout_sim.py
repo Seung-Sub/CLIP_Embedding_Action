@@ -89,7 +89,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion, f4, dual,
-     grid_anchor, grid_obs, wdelta) = load_models(cfg, device)
+     grid_anchor, grid_obs, wdelta, patch_anchor, patch_obs) = load_models(cfg, device)
     is_hflow = getattr(ae, "h_mode", "mlp") in ("flow", "residual_flow")   # flow/residual_flow h면 generator 전달 가능
     pol_flow = hasattr(policy, "_x0")               # FlowPolicy만 generator kwarg 수용 (MLPConcat 미수용)
 
@@ -225,6 +225,20 @@ def main():
             gt = grid_obs(grid_raw(obs) if raw is None else raw)      # (1,Kg,latent)
             return [gt[:, k] for k in range(gt.size(1))]
 
+        def patch_toks(obs):
+            """P-B LangSelPool: 현재 프레임 dense patch 격자 × 태스크 지시문 lang →
+            Kp개 UNGATED 언어-선택 토큰. lang 은 instruction_for(tid) 임베딩(모드 반영)
+            — wrong/blank 에서 쿼리가 바뀌므로 토큰 자체가 바뀜(언어 인과 하류, §4.3)."""
+            _name, anc, cam = patch_anchor
+            if wrist_cam and cam == wrist_cam:
+                im = obs["robot0_eye_in_hand_image"]
+                im = im[::-1].copy() if args.flip else im
+            else:
+                im = frame(obs)
+            tok = anc.encode_images([Image.fromarray(im)])["tokens"]  # (1,P,d)
+            pt = patch_obs(torch.tensor(tok, device=device), lang)    # (1,Kp,latent)
+            return [pt[:, k] for k in range(pt.size(1))]
+
         for ep in range(args.episodes):
             ep_wall0 = time.time()                   # provenance: 에피소드 벽시계 시작
             ep_seed = 10000 * tid + ep               # 에피소드 flow 시드 (구 --flow-fixed-noise와 동일 규약)
@@ -318,6 +332,8 @@ def main():
                                 toks = toks + [w_tok]    # W-B w_tok #10 — canonical 마지막 (A2)
                             else:
                                 toks = toks + grid_toks(obs)
+                        if patch_obs is not None:        # P-B: 언어-선택 patch 토큰 Kp개 (canonical 마지막)
+                            toks = toks + patch_toks(obs)
                         # ζ_g(정책) + ζ_f(f4, 있으면) 를 공유-τ 단일 루프로 샘플.
                         # ζ_f 는 base 조건 noise-flow 로 생성(미래/patch ΔF 무접근).
                         # concat/S1b: 좁은 조건 토큰(lang/wrist/SigLIP2 z)→z 폭 SigLIP2 서브블록 zero-pad (기존=no-op)

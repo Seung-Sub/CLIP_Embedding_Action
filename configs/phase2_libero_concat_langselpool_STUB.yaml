@@ -1,0 +1,82 @@
+# Phase 2 — P-B "LangSelPool" B2 (fusion-substrate arm) — ★STUB: B1 양성일 때만 런치★
+# ══════════════════════════════════════════════════════════════════════════
+# DESIGN_patch_policy_attention_v1 §4.2 sub-arm B2: concat 2048 phase1 (최고 SR 베이스
+# 97.5) 위에서 언어-선택 patch 토큰이 언어델타(c−w ≥ +69) 를 회복하는지 검정.
+# BASE = phase2_libero_fobsfusion_concat_noaug.yaml 상속 (anchor=dualconcat 2048,
+# phase1_libero_fobsfusion_concat.pt) — 유일 추가 = module.patch_obs.
+# 게이트(§7.3 B2 열): SR ≥ concat−CI0 AND c−w ≥ +70.
+#
+# ⚠ 이 파일은 실행 대기 STUB — 사전등록된 실행 조건:
+#   (1) B1(phase2_libero_large256_langselpool) 스크리닝이 게이트 통과 또는 유보-상향일 것
+#   (2) B1 의 P3(entropy)·P4(지시문-스왑 토큰 코사인) probe 가 "선택 실재" 판정일 것
+#   조건 미충족 시 런치 금지 (garden-of-forking-paths 방지 — 설계 §8-2 fallback 1회 규율).
+# 검토 노트: LangSelPool out_dim = latent_dim = 2048 (concat) → out Linear 0.8→2048
+#   (파라미터 ~1.6M 증가, 설계 §4.2 파라미터 표와 일치). lang(1024) 는 텍스트 쿼리로는
+#   원폭 그대로 소비되고 (L2-norm 후 W_q), 조건 토큰으로는 기존 zero-pad 경로 사용.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_fobsfusion_concat.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_fobsfusion_concat   # dualconcat cache_key로 자동 분리
+
+anchor:                          # 본류 관측 = no-mix concat (SigLIP2-L256 ⊕ DINOv3-vitl16) 2048d
+  name: dualconcat
+  projection: joint
+  normalize: false
+  siglip_dir: google/siglip2-large-patch16-256
+  dino_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+  force_size: 256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true
+  wrist_token: true
+  patch_obs:                     # ★P-B B2: 텍스트-조건 patch 풀링 (B1 과 동일 모듈/kv 절충)
+    anchor:
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      force_size: 256
+      pool_to: 8                 #   dense cache_key dinov3-vitl16-256-pool8 (B1 과 캐시 공유)
+    camera: agentview_rgb
+    n_tokens: 1                  #   B1 스크리닝 규격 미러 (K 확전은 별도 사전등록)
+    d_attn: 768
+    heads: 8
+    tok_drop: 0.1
+    group_drop: 0.1
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_concat_langselpool.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_concat_langselpool}

@@ -1,0 +1,79 @@
+# Phase 2 — P-B "LangSelPool" B1 (headline arm): large256-single + 텍스트-조건 patch 풀링 +1토큰.
+# ══════════════════════════════════════════════════════════════════════════
+# DESIGN_patch_policy_attention_v1 §4 (후보 B): 지시문 임베딩이 DINOv3 main(agentview)
+# patch 격자를 cross-attn 으로 질의 → "태스크 유관 기하" 토큰을 관측측에 UNGATED 삽입.
+# B1 = SigLIP2-large256 단독 phase1(1024) 기질 [cheapest, phase1 무변경·재학습 없음] —
+# 통화 ζ 는 순수 언어정렬 공간 유지, 기하는 오직 "언어가 거른" patch 토큰으로만 공급.
+# 토큰열 = [z_prev, z_cur, g(A_past), lang, wrist_sig, langsel×1] = 6 (+1 조건 토큰).
+# F3 결함-수정 전항(설계 §2.3): kv-LN·pos-emb·init 0.02·tok/group_drop 0.1 (모듈 내장).
+# 메모리(설계 §6): kv = pool_to=8 절충(8×8=64 patch) → dense cache_key
+#   dinov3-vitl16-256-pool8 신설 자동 분리 (~4GB fp32 조립, 기존 배관 0줄).
+# patch_obs 미지원 키는 train_phase2 loud-fail (VERIFY A1 상속). 미설정 시 비트 동형.
+# 기준선 = phase2_libero_large256_matchedbase.yaml (하이퍼·시드·split 완전 동일 — 유일
+# diff 는 module.patch_obs 블록 + checkpoint/run_name). 스크리닝 게이트/반증 조건은
+# 설계 §7.3 B1 열: SR CI>0 vs base 85-88 AND c−w ≥ +74 / 반증 P3 entropy≈uniform·P4 스왑-불변.
+# ══════════════════════════════════════════════════════════════════════════
+phase1_ckpt: ~/clip_ws/checkpoints/phase1_libero_siglip2_large256.pt
+
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  wrist_camera: eye_in_hand_rgb
+  chunk_sec: 0.8
+  n_chunk: 16
+  stride: 2
+  val_episodes: 0.2
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256      # pooled 재사용; dense는 cache_key 하위로 분리
+
+anchor:                          # 본류 관측 = large256 (매치드 베이스와 동일)
+  name: siglip2
+  projection: joint
+  normalize: false               # NATIVE-BEST (phase1과 동일)
+  model_dir: google/siglip2-large-patch16-256
+
+module:
+  name: flow
+  flow_source: past
+  flow_steps: 6
+  source_noise: 0.1
+  d_model: 1536
+  layers: 4
+  ctx_layers: 2
+  lang_token: true               # patch_obs 전제 (텍스트 쿼리 = lang 임베딩 경로 재사용)
+  wrist_token: true              # 기존 SigLIP2-wrist 조건 토큰 유지 (매치드 베이스 동일)
+  patch_obs:                     # ★P-B B1: 텍스트-조건 patch 풀링 (LangSelPool, UNGATED)
+    anchor:
+      name: dinov3
+      model_dir: facebook/dinov3-vitl16-pretrain-lvd1689m
+      force_size: 256            #   256/16 = 16×16 patch → 인코딩 시점 8×8 avg-pool
+      pool_to: 8                 #   §6.2 B-1차 절충 — cache_key dinov3-vitl16-256-pool8 자동 분리
+    camera: agentview_rgb        #   main 카메라 (z_cur 와 동일 프레임; B-full 16×16 은 확증 팔)
+    n_tokens: 1                  #   B1 = +1 조건 토큰 (cheapest; K 확전은 B1 양성 후)
+    d_attn: 768                  #   f4.py 배선 동형 (사내 검증 형태)
+    heads: 8
+    tok_drop: 0.1                #   per-token zero-drop (학습시만)
+    group_drop: 0.1              #   K토큰 동시 0화 — 언어-only 경로 보존 강제 (§2.3 ②)
+  f4:
+    enable: false
+
+loss:
+  lat: 0.5
+  act: 1.0
+  wm: 0.0
+  f_cfm: 0.0
+  consist: 0.0
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 2
+  past_noise: 0.05
+  checkpoint: ~/clip_ws/checkpoints/phase2_libero_large256_langselpool.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: phase2_libero_large256_langselpool}

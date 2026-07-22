@@ -1,0 +1,49 @@
+# Phase 1 — CAPACITY SWEEP (docs/PREREG_capacity_sweep.md): g-폭 2x (hidden_g=1024), h-폭 고정(512).
+# ══════════════════════════════════════════════════════════════════════════
+# BASE = phase1_libero_siglip2_large256.yaml 완전 동일 (data/anchor/loss/train/seed) —
+#   유일 diff = model.hidden_g/hidden_h (독립 폭 노브, networks.py DeltaAE) +
+#   checkpoint/run_name. 오프라인 전용 사전등록 셀: 폐루프 판단은 PREREG 게이트 통과 후 별도.
+# width 팔: {0.5, 1, 2, 4}× of hidden=512 → {256, 512, 1024, 2048}. 1×-팔은 재적합
+#   기준선(결정론/재현 체크 겸용 — g1 과 h1 은 아키텍처 동일). 캐시 전량 재사용(인코딩 0회).
+# ══════════════════════════════════════════════════════════════════════════
+data:
+  source: libero
+  root: ~/clip_ws/data/libero/libero_spatial
+  camera: agentview_rgb
+  chunk_sec: 0.8               # 20Hz × 16스텝
+  n_chunk: 16
+  val_episodes: 0.2            # 비율 — 500 데모 중 100 (태스크 혼합 무작위)
+  cache_dir: /data2/clip_ws_cache/cache/libero_emb_large256   # 기존 캐시 전량 재사용
+
+anchor:
+  name: siglip2
+  model_dir: google/siglip2-large-patch16-256   # 기질 동일 (large256-single)
+  projection: joint
+  normalize: false             # NATIVE-BEST (기존 large256 phase1 과 동일)
+
+model:
+  latent_dim: 768              # train_phase1.py가 anchor.dim(1024)으로 자동 덮어씀
+  hidden: 512                  # 기준 폭 (null 인 쪽이 이 값을 상속)
+  hidden_g: 1024
+  hidden_h: null
+  layers: 4
+  dropout: 0.2
+  state_cond: true
+
+loss:
+  align: 0.5
+  recon: 0.5
+  cycle: 0.25
+
+train:
+  batch_size: 256
+  lr: 1.0e-4
+  adam_betas: [0.95, 0.999]
+  scheduler: cosine
+  warmup_steps: 500
+  epochs: 50
+  early_stop_patience: 20
+  seed: 0
+  checkpoint: ~/clip_ws/checkpoints/capsweep/large256_cap_g2.pt
+
+wandb: {enabled: true, project: clipvp, mode: online, run_name: large256_cap_g2}

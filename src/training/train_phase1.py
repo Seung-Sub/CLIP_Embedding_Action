@@ -381,7 +381,15 @@ def main():
                     sigmoid_bias0=m_cfg.get("sigmoid_bias0", -5.5),
                     align_block=m_cfg.get("align_block"),
                     h_mode=m_cfg.get("h_mode", "mlp"),
-                    h_flow_steps=m_cfg.get("h_flow_steps", 5)).to(device)
+                    h_flow_steps=m_cfg.get("h_flow_steps", 5),
+                    # capacity sweep (docs/PREREG_capacity_sweep.md): g/h 폭 독립 노브.
+                    # 미설정(None) = hidden 그대로 → 기존 config 비트 동형.
+                    hidden_g=m_cfg.get("hidden_g"),
+                    hidden_h=m_cfg.get("hidden_h")).to(device)
+    if m_cfg.get("hidden_g") or m_cfg.get("hidden_h"):
+        print(f"[capacity sweep] hidden_g={m_cfg.get('hidden_g') or m_cfg['hidden']} / "
+              f"hidden_h={m_cfg.get('hidden_h') or m_cfg['hidden']} "
+              f"(base hidden={m_cfg['hidden']})")
     if model.h_mode == "flow":                    # S2: h-flow x0 스케일 = 액션청크 타깃 std
         model.h.x0_std.fill_(float(np.asarray(C_tr).reshape(len(C_tr), -1).std()))
         print(f"h-flow decoder: steps={model.h.steps}, x0_std={model.h.x0_std.item():.4f}")

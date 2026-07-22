@@ -61,7 +61,10 @@ def load_models(cfg, device):
                  sigmoid_bias0=p1["model"].get("sigmoid_bias0", -5.5),
                  align_block=p1["model"].get("align_block"),
                  h_mode=p1["model"].get("h_mode", "mlp"),
-                 h_flow_steps=p1["model"].get("h_flow_steps", 5)).to(device).eval()
+                 h_flow_steps=p1["model"].get("h_flow_steps", 5),
+                 # capacity sweep ckpt 호환 (구 ckpt 는 키 부재 → None = 비트 동형)
+                 hidden_g=p1["model"].get("hidden_g"),
+                 hidden_h=p1["model"].get("hidden_h")).to(device).eval()
     ae.load_state_dict(ck1["state_dict"])
     ck2 = torch.load(os.path.expanduser(cfg["train"]["checkpoint"]),
                      map_location="cpu", weights_only=False)
@@ -122,6 +125,38 @@ def load_models(cfg, device):
         grid_obs = grid_obs.to(device).eval()
         Kg = grid_obs.n_tokens
 
+    # ---- P-B LangSelPool (module.patch_obs 있을 때만; 없으면 no-patch 기존 경로와 완전 동일) ----
+    #  train_phase2.py 의 patch_obs 구성을 미러링(UNGATED, lang-쿼리 cross-attn). 차원은
+    #  저장 가중치에서 직접 도출(f4 미러) — 앵커 patch_dim 오염(1152 함정)과 독립적으로 정확.
+    patch_anchor, patch_obs, Kp = None, None, 0
+    if m.get("patch_obs") and ck2.get("patch_obs") is not None:
+        from core.anchor import get_anchor
+        from models.obs_fusion import LangSelPool
+        p_cfg = m["patch_obs"]
+        penc = p_cfg["anchor"]
+        panc = get_anchor({"anchor": penc})
+        if penc["name"] == "siglip2":
+            panc.save_tokens = True
+        patch_anchor = (penc["name"], panc,
+                        p_cfg.get("camera", penc.get("camera", "agentview_rgb")))
+        psd = ck2["patch_obs"]
+        patch_obs = LangSelPool(patch_dim=psd["kv_proj.weight"].shape[1],
+                                text_dim=psd["text_q.weight"].shape[1],
+                                out_dim=p1["model"]["latent_dim"],
+                                n_patch=psd["pos_emb"].shape[0],
+                                n_tokens=psd["query_offset"].shape[0],
+                                d_attn=p_cfg.get("d_attn", 768),
+                                heads=p_cfg.get("heads", 8),
+                                tok_drop=p_cfg.get("tok_drop", 0.1),
+                                group_drop=p_cfg.get("group_drop", 0.1))
+        patch_obs.load_state_dict(psd, strict=True)
+        patch_obs = patch_obs.to(device).eval()
+        Kp = patch_obs.n_tokens
+        # 롤아웃 patch_dim 함정 이중 방어 (DESIGN_WD_WAprime §3.2): 앵커 실폭 == ckpt kv 입력폭
+        assert panc.patch_dim == psd["kv_proj.weight"].shape[1], \
+            (f"patch_obs: 앵커 patch_dim {panc.patch_dim} != ckpt kv_proj 입력폭 "
+             f"{psd['kv_proj.weight'].shape[1]} — 앵커/캐시 키 불일치")
+
     # ---- W-B Δ̄w-token (grid_obs.wrist_delta=true 일 때만; 없으면 wdelta=None = 기존 동형) ----
     #  N2 재척도 스칼라(train 통계)는 phase2 ckpt dict "wrist_delta_std" 에서 복원 —
     #  rollout 은 grid 인코딩(사영 전 pool2 patch-mean)에서 w_tok 을 유도(추가 인코딩 0회).
@@ -135,7 +170,7 @@ def load_models(cfg, device):
                   "sigma_delta": float(wds["sigma_delta"])}
 
     policy = build_policy_from_cfg(
-        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K + Kg
+        m, n_tokens=3 + int(use_lang) + int(use_wrist) + K + Kg + Kp
         + int(wdelta is not None),
         latent_dim=p1["model"]["latent_dim"],
         action_flat_dim=ck1["n_chunk"] * ck1["action_dim"]).to(device).eval()
@@ -174,17 +209,18 @@ def load_models(cfg, device):
         f4.load_state_dict(fsd, strict=True)
         f4 = f4.to(device).eval()
 
-    # obs_anchors/obs_fusion/f4/grid_obs 는 해당 모듈일 때만 non-None; 미사용 호출부는 *_로 무시.
-    # dual=None (단일 스트림). grid_anchor/grid_obs/wdelta 는 14·15·16번째(뒤에 append → *_ 호출부 안전).
+    # obs_anchors/obs_fusion/f4/grid_obs/patch_obs 는 해당 모듈일 때만 non-None; 미사용 호출부는 *_로 무시.
+    # dual=None (단일 스트림). grid_anchor/grid_obs/wdelta 는 14·15·16번째,
+    # patch_anchor/patch_obs 는 17·18번째 (뒤에 append → *_ 호출부 안전).
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
             wrist_cam, obs_anchors, obs_fusion, f4, None, grid_anchor, grid_obs,
-            wdelta)
+            wdelta, patch_anchor, patch_obs)
 
 
 def _load_models_dual(cfg, device, ck1):
     """dual-stream 모델 로드 (DualDeltaAE + FlowPolicy). load_models 와 동일 arity의
-    16-튜플 반환 — 13번째 dual dict 로 caller(rollout)가 wrist 앵커/dim_cat/디코딩 분기.
+    18-튜플 반환 — 13번째 dual dict 로 caller(rollout)가 wrist 앵커/dim_cat/디코딩 분기.
     obs/f4/aug 는 dual 미지원 → 모두 None. wrist_cam 은 손목 프레임 인코딩용으로 반환.
     W-C: stream_standardize(N3)는 phase1 config 로 재구성(buffer 는 state_dict 복원),
     x0_per_dim(N4)은 build_policy_from_cfg 가 module config 에서 자동 반영,
@@ -212,10 +248,10 @@ def _load_models_dual(cfg, device, ck1):
     dual = {"dim_main": dim_main, "dim_wrist": dim_wrist, "dim_cat": dc,
             "anchor_wrist": ck2["config"]["anchor_wrist"],
             "wrist_cond_sig": wc_sig}
-    # use_lang 만 의미; use_wrist/obs/f4/grid/wdelta 는 dual 경로에서 미사용(None).
+    # use_lang 만 의미; use_wrist/obs/f4/grid/wdelta/patch 는 dual 경로에서 미사용(None).
     return (ae, policy, ck1["a_mean"], ck1["a_std"], ck1["n_chunk"],
             ck1["action_dim"], use_lang, ck1.get("chunk_repr", "time"),
-            wrist_cam, None, None, None, dual, None, None, None)
+            wrist_cam, None, None, None, dual, None, None, None, None, None)
 
 
 def sample_zeta(policy, f4, tokens, generator=None):
@@ -262,7 +298,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (ae, policy, a_mean, a_std, n_chunk, act_dim, use_lang,
      repr_kind, wrist_cam, obs_anchors, obs_fusion, _f4, dual,
-     grid_anchor, grid_obs, wdelta) = load_models(cfg, device)
+     grid_anchor, grid_obs, wdelta, patch_anchor, patch_obs) = load_models(cfg, device)
     ds = LiberoDataset(cfg)
     clip = get_anchor(cfg)          # 앵커 config 반영 (무-anchor면 ClipAnchor=ClipWrapper와 동일)
     clip_wrist = get_anchor({"anchor": dual["anchor_wrist"]}) if dual else None
@@ -290,6 +326,9 @@ def main():
     # F5-H L1: 그리드 관측 앵커(DINOv3) dense patch 격자 D[t] (Z[t] 와 동일 인덱스 정렬)
     D_grid = (ds.dense_embeddings(grid_anchor[1], ep, grid_anchor[2])
               if grid_obs is not None else None)
+    # P-B: LangSelPool 앵커 dense patch 격자 D[t] (Z[t] 와 동일 인덱스 정렬)
+    D_patch = (ds.dense_embeddings(patch_anchor[1], ep, patch_anchor[2])
+               if patch_obs is not None else None)
     lang = torch.tensor(ds.instruction_embedding(clip, ep)[None],
                         device=device) if use_lang else None
     T = len(acts)
@@ -336,6 +375,10 @@ def main():
                 if grid_obs is not None:              # F5-H L1: UNGATED 그리드 토큰 Kg개를 열 끝에 추가
                     grid_tok = grid_obs(torch.tensor(D_grid[t][None], device=device))
                     toks = toks + [grid_tok[:, k] for k in range(grid_tok.size(1))]
+                if patch_obs is not None:             # P-B: 언어-선택 patch 토큰 Kp개 — canonical 마지막
+                    patch_tok = patch_obs(
+                        torch.tensor(D_patch[t][None], device=device), lang)
+                    toks = toks + [patch_tok[:, k] for k in range(patch_tok.size(1))]
                 if wdelta is not None:                # W-B w_tok #10 — canonical 마지막 (A2)
                     wd = ((D_grid[t].mean(0) - D_grid[max(t - span, 0)].mean(0))
                           * wdelta["scale"]).astype(np.float32)
