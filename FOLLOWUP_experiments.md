@@ -209,3 +209,47 @@
   | **W-C** | wrist 변위 **추론**(g_wrist+확장 h+결합 flow), 스케일 표준화 수리판 | 82.5 | −4.5 NS | +73.5 정상 | **널 — 타깃측 종결** (표준화는 작동: align 균형 수렴·G2-C 1.4배 개선 — 그래도 무이득 = 스케일 변명 소진) |
 - **PI 제안 2건의 측정-선행 판정**: 스트림별 분리 정책 — **금지**(교차쌍 h 민감도 0.662>0.60: h는 두 변위를 결합 코드로 읽음, 분리 예측 쌍은 다양체 이탈). 동적 가중 — **무익**(oracle headroom +0.000025 = kill 기준의 1/400; N3 표준화 공간에서 wrist 상대크기가 파지 직전 +33% 자연 상승 = 원하던 동작을 데이터가 이미 수행).
 - **서사 갱신**: "복잡화 일관 무익"의 **최초 예외 = 조건화-측 wrist 국소 기하**. 삽입점 지도 완성형 — 기하 정보는 (i) 관측/조건화에서만 양성(S1 융합, W-A wrist), (ii) 타깃/코드-측은 백본·스케일·수리 불문 일관 음성(C1/C2·S1b·dual-stream·W-C). 진행 중: W-A 확증 50롤×3시드 — 관건은 언어 +70 회복(wrist 기하로 언어 없이 푸는 경로 = F3-방향 리스크 감시).
+
+## 16. 콜리그 retrieval 제어 검증 + C3′ 재편 + R-시리즈 (2026-07-22~24)
+
+*상세: `reports/2026-07-22_retrieval_capacity_session/{ANALYSIS_colleague_retrieval_control,RESULT_rseries_R0R1}.md`.*
+
+- **의도**: 동료 랩(SigLIP@ed54d17)의 "retrieval 기반 제어 = 진짜 wow(언어→검색→실행이 조향을 이김)" 헤드라인이 우리 T-0 사망(§13)과 모순인가 — 코드·1차 JSON으로 재검증(PI 지시, READ-ONLY 무변경) 후 우리 기질로 이식.
+- **구현**: (a) 그들 `lang_adapter_wow/`·`banks/*.json`·결과 JSON 코드-레벨 재구성. (b) 어댑터를 **우리 기질**(large256-single ζ=g(a,z_t), SigLIP2-large256 텍스트타워)로 포트 — R-0(오프라인 어댑터 재현), R-1(correct/wrong/셔플 검색 판별 하네스), §6 R-0b(잔차 효과벡터 from-scratch 어댑터). banks 재사용, 코드 `scratchpad/rseries/`.
+- **결과**:
+  - **기전 정정**: 그들 wow = 벡터 주입이 아니라 **언어 코사인 top-1 → 녹음된 시연 action chunk 오픈루프 재생**(정책·h·Δz 슬롯 미경유). 요구 성질은 방향 대응(T-0의 사인)이 아니라 **판별적 정렬**뿐 + 은행이 서브골 조각 입도라 T-0의 두 사망 원인(방향 대응 부재·입도 불일치)을 구조적으로 우회.
+  - **랩 내 이중 해리**: 같은 어댑터로 주입(E5 잔차 조향 camera dir-acc 0.29→0.58, 게이트 0.85 FAIL) vs 검색(8/8) — 실패 경계선이 "정렬 품질"이 아니라 **"주입이냐 인덱스냐"**. 우리 WEEK1(T-0/M6-b 사망 + A5 통과)의 실행-측 확증.
+  - **R-0(우리 기질)**: 분할 동료-정확 일치(train 1995 / held-out 497 seg). canonical top-1 **0.972**(그들 0.974) G-R0a PASS, unseen 템플릿 0.952 G-R0c-1 PASS. **우리 독립 3rd셋 0.773 G-R0c-2 FAIL**(평균-emb 0.944) — 실패는 grasp 붕괴(0.04, 94/100 release 흡수)에 집중 = paraphrase-불변성의 **어휘-반경 한계**(학습동사 밖 "unhand/capture/scoot"는 SigLIP2 텍스트기하 임의이웃으로 붕괴). 그들 novel3(0.970)가 통과한 건 학습동사 재조합이라 = 3rd셋 독립성 수준이 결과 좌우.
+  - **정직 대조(G-R0b)**: 텍스트-무관 MLP 0.968 ≈ 어댑터 0.972(**분류기 등가** — canonical 정확도는 언어 공로 아님, 고유가치=paraphrase-불변+언어 인터페이스뿐), 상태-잔차화 ζ−r(z_t) 시 0.749/unseen 0.543 급락(A5 조건부 "상태-잔차 대조 의무"가 옳았음).
+  - **R-1 검색 판별**: correct **8/8**(마진 0.537) + 스왑 **56/56** vs 셔플 마진 0.185(1/3 붕괴)·넌센스 0.056 = 이중 해리 우리-기질 재현. 셔플 21/24가 원 클래스 유지(SigLIP2 bag-of-words 성향)하되 마진으로 분리 → R-2에 마진-임계 거부 규칙 권고.
+  - **R-0b(상태-지분 정량)**: 잔차 어댑터 canonical 0.742 = **혼합 대역** — 우연-상회 신호의 **70% 상태-무관 / 45%만 unseen 보존(=일반화 ~55% 상태-운반)**. 클래스 비대칭: 그리퍼 이벤트(grasp/release)는 잔차화 거의 무손실 = state-free, approach/place(궤적 위상)는 −0.45 상태-의존. 방향 라벨은 z_t 단독 MLP 0.895 = 벤치마크에서 가장 장면-결정적(2차 사전등록 가설 반증 — R-2 방향 실행은 반대쌍 반사실 필수).
+- **해석**: T-0 사망이 "C3 전체의 죽음"에서 **"C3-강(zero-demo 벡터산술) 죽음 + C3-약(검색-매개 선택) 경계 확정"**으로 재프레임. C3′ 정직 문장 = *"canonical 판별력은 대부분(70%) 상태-무관 액션 신호지만 일반화의 절반 이상은 장면-상태가 실어 나르고, 유효성은 학습 paraphrase 어휘 반경 안으로 한정되며 반경 밖 실패는 저마진으로 자기표식"*. WEEK1의 A5·M6-a가 각주에서 헤드라인 예언으로 승격. R-2(반대쌍 zero-demo 실행)·R-3(retrieval-conditioned decoding)은 GPU 해제 후 폐루프 다리.
+
+## 17. W-A 확증 최종 + tradeoff 프런티어 (2026-07-24)
+
+*상세: `reports/2026-07-22_retrieval_capacity_session/RESULT_wrist_confirmation.md`. 스크리닝 근거: §15.*
+
+- **의도**: §15 스크리닝의 W-A(+5.5pp, 언어 +65.5 유보밴드)를 사전등록 규칙(SR paired CI>0 **AND** 언어 c−w≥+70pp → "채택 아키텍처")으로 확증 — 관건은 언어 공동기준의 +70 회복.
+- **구현**: 3 train-seed × 2 arm(matchedbase/wristpatch) × 2 mode(correct/wrong) = 12 run, 각 libero_spatial 10task × 50rollout = 500ep/run = **총 6,000ep**. phase1 large256-single 공유, phase2 seed{1,2,3} 재학습. MUJOCO osmesa + retry-supervisor. 판정은 유실된 verdict 스크립트 대신 **per-episode JSONL(`outputs/eval/runs/*/episodes.jsonl`)에서 직접 부트스트랩 재계산**(commit 3f0d984 provenance 하네스 자기입증).
+- **결과**:
+  - **성능(correct SR)**: pooled per-task matchedbase **85.7** / wristpatch **92.6 = +6.9pp**, paired per-task bootstrap 10k **95% CI[+4.9, +9.1] = SIG>0 통과**. per-task 델타 전부 양(t0+3…**t5+11 t7+9 t9+13**) = 이득이 파지·공간 재참조 태스크 집중(설계·스크리닝 패턴 재현), 3-seed 일관(+8.2/+5.6/+7.0), 스크리닝 +5.5와 정합.
+  - **언어 공동기준(c−w)**: pooled wristpatch **+63.7pp** vs matchedbase **+73.9pp** — 게이트 +70 미달, 유보밴드(65–75) 하단 65도 **하회**. wrist가 wrong 지시에서도 ~28–30% 성공(base ~10–13%) = **손목 기하로 언어 없이 파지하는 경로**(3-seed 일관 61.6/65.0/64.4).
+  - **사전등록 판정**: SR 통과 · 언어 미달 → **W-A는 "제안 아키텍처"로 승격 안 함, SR↔언어 tradeoff 프런티어의 새 점**으로 자리.
+- **해석**:
+  1. **캠페인 최초의 확증된 양의 SR 아키텍처 추가** — h-flow/actionflow/crop/W-C가 전부 중립~음성이던 것과 대비. "복잡화 일관 무익"의 유일 예외 = **조건화-측 wrist 국소 기하**(삽입점 지도의 마지막 조각).
+  2. **SR↔언어 tradeoff 법칙의 4번째 독립 재현**(융합 다이얼·crop·W-A 스크리닝에 이어 확증) = C-2 기여 결정적 강화. 프런티어 확정 점 2개 추가(matchedbase 85.7/+73.9, wristpatch 92.6/+63.7).
+  3. **응용 선택 축**: 성능 우선→W-A, 언어 충실 우선→base. 이 선택 축의 존재 자체가 해석적 기여.
+  4. **열린 후보 W-A′**(§18): wrist 토큰을 DINOv3→SigLIP2 통일 공간으로 — H-L1(같은 언어 타워라 언어 희석 완화) 성립 시 프런티어를 **언어축으로 미는 유일 후보**.
+
+## 18. 미검정 예약 큐 — W-A′/P-B/W-D/capacity-sweep/demo-redesign (2026-07-22, launch-ready)
+
+*상세: `reports/2026-07-22_retrieval_capacity_session/{DESIGN_WD_WAprime_v1,RESULT_pregates,PREREG_capacity_sweep,PAPER_ARCHITECTURE_v2}.md`. GPU가 W-A 확증에 점유되어 전부 사전등록·CPU 킬게이트까지만 완료, 폐루프 착수 대기.*
+
+- **의도**: PI 잔존 직관·의심을 닫힌 음성 지도(§15 W-C 종결·M-B JOINT_REQUIRED·M-C 무-headroom·Phase-A 프라이어) 위반 없이, 착수-전 킬게이트로 지출을 캡한 상태로 예약. "지는 쪽도 산출물이 있는 실험만 연다" 규율.
+- **구현·결과 (사전등록 셀별)**:
+  - **W-D "AuxΔw"** (손목 추론의 마지막 미검정 기전 = 손실-측): 미래 손목변위 Δz_wrist(t→t+16, SigLIP2 공간)를 ctx 트렁크 보조 헤드로 예측 — **h/액션 경로에 단 1비트도 미진입**(재부호화 논증·M-B 무관). 학습-전 킬게이트 **R-D0 GO 아슬아슬**(r_full−r_state +0.0227 ≥ +0.02, 마진 0.0027 — 초과신호 거의 a_emb=g 임베딩). E8 "보류/킬" 권고 존치(어느 기여도 W-D 미요구).
+  - **W-A′ "SigPatch"** (기전 귀속 + 의미 접근성): W-A의 DINOv3 wrist 패치를 SigLIP2-large256 패치로 **인코더 정체성 1개만 교체**(파라미터-정확 매치). 킬게이트 **R-A′ GO 동등**(SigLIP2 uplift +0.0459 ≈ DINO +0.0456, 비율 **1.008** → "W-A 이득=DINO 기하 특이" 오프라인 기각, 손목 패치정보 인코더-불문). 언어 양가설 사전등록(H-L1 희석완화/H-L2 의미간섭, 판별 readout=t0/t2/t4 wrong-모드 95/85/65 기준). §17 확증이 "SR 승리·언어 미달"로 끝났으므로 **W-A′가 결정 셀로 승격**(언어 회복 유일 저가 후보).
+  - **P-B LangSelPool(B1)** (관측측 patch 활용): 텍스트-쿼리 patch pooling(kv-LN/pos-emb/tok+group drop/attn-entropy 로깅, F3 결함 전면 수정판) 구현·8단 스모크 PASS(commit 093cc1b). 롤아웃은 `instruction_for(tid)` 쿼리로 wrong/blank 판별평가에 언어 인과 유지. B2는 STUB(사전등록 조건부). 폐루프 대기.
+  - **g/h 용량 스윕** (PI "phase1 용량 부족?" 종결): DeltaAE hidden_g/hidden_h 독립 노브(기본 비트동형) + config 8종(폭 0.5–4×, g/h 귀속 분리) + probe_h_jacobian. 판정=전팔 ±0.01 무죄(영구 종결) / (4×−0.5×)≥+0.03 단조 폐루프 개설. 오프라인 4–8 GPU-h, launch-ready.
+  - **의도-판독 데모 재설계** (G-D1 FAIL 대응): 정책 ζ̂ top-1 0.363(데이터 ζ와 cos 0.188, 학습시 lat_cos 0.203과 정합 = 버그 아닌 **분포이동+입도**), ζ̂-재적합 후 0.786 < 0.85 → **E2 데모 "오프라인 판독 그림"으로 강등**(PAPER v2 §5 E2 조항 발동). 부분 구제 수치: 마진-게이팅 0.856@커버리지80%, place∪release 병합 7→6클래스 0.871 — PI 재가 시 제한 데모 부활. `adapter_zetahat.pt`가 어느 판이든 필수 기반.
+- **해석**: 논문 삽입점 지도의 마지막 공란 = "손실-측"(W-D 결과로 충전, 널이면 타깃/관측/손실 3-기전 소진 = "wrist 추론" 종결 각주). W-A′ 결과 = 기전 귀속 문장(DINO 기하 vs 인코더-불문 공간 디테일) 승패 무관 수록 + H-L1 실측 시 프런티어를 안쪽으로 미는 유일 점. 전 셀 착수-전 CPU 킬게이트로 반론("복잡화 0승인데 또 여는가")의 지출을 ≤1 GPU-h로 캡.

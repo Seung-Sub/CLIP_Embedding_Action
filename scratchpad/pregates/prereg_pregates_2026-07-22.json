@@ -1,0 +1,35 @@
+{
+  "written": "2026-07-22 (BEFORE any result JSON in outputs/pregates/ — mtime convention)",
+  "executor": "gate-executor session, CPU-only (GPUs reserved for W-A confirmation rollouts)",
+  "host": "kist_a6000_ss (/workspace/CLIP_ws), OMP_NUM_THREADS=8, CUDA_VISIBLE_DEVICES=''",
+  "gates": {
+    "G-D1": {
+      "source": "docs/PAPER_ARCHITECTURE_v2.md §3 사전 게이트",
+      "question": "policy-generated zeta-hat (NOT dataset zeta) readable through adapter_main.pt?",
+      "policy": "checkpoints/phase2_libero_large256_matchedbase.pt (train.seed=2) + phase1_libero_siglip2_large256.pt",
+      "protocol": "held-out 100 episodes (RandomState(2).permutation, val=perm[:100] — identical to phase2/R-0 split). Offline forward passes on dataset conditioning tokens [z_prev, z_cur, g(A_past), lang, z_wrist]; deterministic x0=past (eval mode, no source noise); replan grid t = span, span+8, ... while t+span <= T (mirrors rollout exec-horizon 8). Label = R-0 bank segment with MAX overlap with future window [t, t+16); only windows overlapping >=1 labeled segment scored. Classify P_action(zeta_hat) vs canonical-8 P_text (nearest phrase, max-cos), margin = best - 2nd class score.",
+      "gate": "canonical top-1 >= 0.85 -> PASS (demo E2 proceeds). FAIL -> diagnose zeta-hat noise (cos vs g(A_GT_chunk, z_t)) vs class confusion; refit-on-zeta-hat allowed per §3 before demoting demo to offline figure.",
+      "reference": "R-0 heldout canonical 0.972; R-1 correct margin baseline 0.537 (dataset zeta, text->bank direction)"
+    },
+    "R-D0": {
+      "source": "docs/DESIGN_WD_WAprime_v1.md §2.4",
+      "question": "does future Delta z_wrist(t->t+16) in SigLIP2 space contain signal beyond state?",
+      "target": "Zw_sig(t+16) - Zw_sig(t), SigLIP2-large256 pooled wrist RAW (cache libero_emb_large256/siglip2-so400m/joint/raw)",
+      "arms": {
+        "r_state": "[z_main(t) 1024 + z_wrist_sig(t) 1024]",
+        "r_full (GATE ARM)": "[state + past-chunk features] where past-chunk features = normalized past action chunk flatten (16x7=112) + a_emb = g(A_past, z_prev) (1024) — the action features the W-A conditioning actually carries",
+        "diagnostics": "state+chunk112 only; state+a_emb only; state+DINOv3 wrist pool2 patch4 (design-doc variant)"
+      },
+      "protocol": "all 500 eps, stride 2, split seed 2 (400 train / 100 val), RidgeCV alphas 0.1..1e4, train-stats standardization, held-out per-dim R^2 uniform mean over 1024 dims (R-bar^2)",
+      "gate": "r_full - r_state < +0.02 -> KILL W-D before training (aux supervision would teach nothing the conditioning lacks)"
+    },
+    "R-Aprime": {
+      "source": "docs/DESIGN_WD_WAprime_v1.md §3.4 (R-A' kill-gate)",
+      "question": "do SigLIP2-large256 wrist PATCH (2x2-pooled) tokens carry the gripper information DINOv3 patches carry?",
+      "arms": "uplift_X = gripR2([X-patch4 flat 4096 + z_wrist_sig + z_main] -> A_fut) - gripR2([z_wrist_sig + z_main] -> A_fut), X in {SigLIP2-pool2, DINOv3-pool2}; probe_g0_wrist_cell.py methodology (same alphas, standardization, per-dim R2, gripper dim 6, grasp/transport masks)",
+      "subset": "SigLIP2 wrist patch cache absent (pool_to not implemented for Siglip2Anchor) -> CPU-encode SUBSET: 120 episodes = first 96 of train perm + first 24 of val perm (deterministic, no extra RNG). BOTH arms recomputed on the SAME subset/split/targets (fairness). GPU borrow FORBIDDEN.",
+      "gate": "uplift_sig < 0.7 x uplift_dino -> KILL W-A' before training ('DINO-geometry-specific' offline verdict)",
+      "reference": "full-split DINO uplift +0.0332 (outputs/wrist_cell/probe_g0_wrist_cell.json, n_va 5502)"
+    }
+  }
+}

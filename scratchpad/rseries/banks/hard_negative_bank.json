@@ -1,0 +1,59 @@
+{
+ "suite": "libero_spatial",
+ "note": "per canonical phrase -> template hard negatives (direction-flip / verb-swap / object-swap / same-task-other-step)",
+ "n_phrases": 8,
+ "phrases": {
+  "approach the black bowl": [
+   "approach the wooden cabinet",
+   "grasp the black bowl",
+   "move away from the black bowl",
+   "retreat from the black bowl"
+  ],
+  "grasp the black bowl": [
+   "grasp the cookie box",
+   "move the black bowl backward",
+   "move the black bowl forward",
+   "move the black bowl left",
+   "move the black bowl right",
+   "open the gripper",
+   "place the black bowl on the plate",
+   "release the black bowl"
+  ],
+  "move the black bowl backward": [
+   "move the black bowl forward",
+   "move the black bowl right",
+   "move the wooden cabinet backward",
+   "place the black bowl on the plate"
+  ],
+  "move the black bowl forward": [
+   "move the black bowl backward",
+   "move the black bowl left",
+   "move the table center forward",
+   "place the black bowl on the plate"
+  ],
+  "move the black bowl left": [
+   "move the black bowl forward",
+   "move the black bowl right",
+   "move the table center left",
+   "place the black bowl on the plate"
+  ],
+  "move the black bowl right": [
+   "move the black bowl backward",
+   "move the black bowl left",
+   "move the top drawer of the wooden cabinet right",
+   "place the black bowl on the plate"
+  ],
+  "place the black bowl on the plate": [
+   "approach the black bowl",
+   "pick up the black bowl from the plate",
+   "place the cookie box on the plate",
+   "release the black bowl"
+  ],
+  "release the black bowl": [
+   "approach the black bowl",
+   "close the gripper on the black bowl",
+   "grasp the black bowl",
+   "release the top drawer of the wooden cabinet"
+  ]
+ }
+}

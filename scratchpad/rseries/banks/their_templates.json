@@ -1,0 +1,280 @@
+{
+ "para_aug_per_class": {
+  "approach the black bowl": [
+   "draw closer to the black bowl",
+   "get near the black bowl",
+   "go to the black bowl",
+   "head over to the black bowl",
+   "move the gripper to the black bowl",
+   "navigate to the black bowl",
+   "position the arm at the black bowl",
+   "reach toward the black bowl",
+   "steer the gripper to the black bowl"
+  ],
+  "grasp the black bowl": [
+   "clamp onto the black bowl",
+   "clasp the black bowl",
+   "close the gripper on the black bowl",
+   "clutch the black bowl",
+   "grab the black bowl",
+   "grip the black bowl firmly",
+   "hold the black bowl tight",
+   "pick up the black bowl",
+   "secure the black bowl in the gripper"
+  ],
+  "move the black bowl backward": [
+   "carry the black bowl backward",
+   "drag the black bowl backward",
+   "draw the black bowl backward",
+   "ease the black bowl backward",
+   "pull the black bowl toward the rear",
+   "push the black bowl back",
+   "relocate the black bowl backward",
+   "shift the black bowl backward",
+   "transport the black bowl backward"
+  ],
+  "move the black bowl forward": [
+   "carry the black bowl forward",
+   "drag the black bowl forward",
+   "draw the black bowl forward",
+   "ease the black bowl forward",
+   "propel the black bowl toward the front",
+   "push the black bowl ahead",
+   "relocate the black bowl forward",
+   "shift the black bowl forward",
+   "transport the black bowl forward"
+  ],
+  "move the black bowl left": [
+   "carry the black bowl left",
+   "drag the black bowl to the left",
+   "draw the black bowl leftward",
+   "ease the black bowl left",
+   "push the black bowl to the left",
+   "relocate the black bowl to the left",
+   "shift the black bowl left",
+   "steer the black bowl to the left",
+   "transport the black bowl left"
+  ],
+  "move the black bowl right": [
+   "carry the black bowl right",
+   "drag the black bowl to the right",
+   "draw the black bowl rightward",
+   "ease the black bowl right",
+   "push the black bowl to the right",
+   "relocate the black bowl to the right",
+   "shift the black bowl right",
+   "steer the black bowl to the right",
+   "transport the black bowl right"
+  ],
+  "place the black bowl on the plate": [
+   "arrange the black bowl on top of the plate",
+   "lay the black bowl on the plate",
+   "leave the black bowl resting on the plate",
+   "lower the black bowl onto the plate",
+   "place the black bowl down onto the plate",
+   "position the black bowl on the plate",
+   "put the black bowl on the plate",
+   "set the black bowl down on the plate",
+   "settle the black bowl onto the plate"
+  ],
+  "release the black bowl": [
+   "drop the black bowl",
+   "free the black bowl from the gripper",
+   "let go of the black bowl",
+   "let the black bowl go",
+   "let the black bowl out of the gripper",
+   "loosen the gripper on the black bowl",
+   "open the gripper",
+   "relax the gripper on the black bowl",
+   "ungrip the black bowl"
+  ]
+ },
+ "para_bank_per_class": {
+  "approach the black bowl": [
+   "go to the black bowl",
+   "move the gripper to the black bowl",
+   "reach toward the black bowl"
+  ],
+  "grasp the black bowl": [
+   "close the gripper on the black bowl",
+   "grab the black bowl",
+   "pick up the black bowl"
+  ],
+  "move the black bowl backward": [
+   "carry the black bowl backward",
+   "shift the black bowl backward",
+   "transport the black bowl backward"
+  ],
+  "move the black bowl forward": [
+   "carry the black bowl forward",
+   "shift the black bowl forward",
+   "transport the black bowl forward"
+  ],
+  "move the black bowl left": [
+   "carry the black bowl left",
+   "shift the black bowl left",
+   "transport the black bowl left"
+  ],
+  "move the black bowl right": [
+   "carry the black bowl right",
+   "shift the black bowl right",
+   "transport the black bowl right"
+  ],
+  "place the black bowl on the plate": [
+   "lower the black bowl onto the plate",
+   "put the black bowl on the plate",
+   "set the black bowl down on the plate"
+  ],
+  "release the black bowl": [
+   "drop the black bowl",
+   "let go of the black bowl",
+   "open the gripper"
+  ]
+ },
+ "unseen_templates": {
+  "approach the black bowl": [
+   "advance the gripper toward the black bowl",
+   "bring the arm near the black bowl"
+  ],
+  "grasp the black bowl": [
+   "seize the black bowl",
+   "take hold of the black bowl"
+  ],
+  "move the black bowl backward": [
+   "nudge the black bowl to the rear",
+   "slide the black bowl backwards"
+  ],
+  "move the black bowl forward": [
+   "nudge the black bowl to the front",
+   "slide the black bowl frontward"
+  ],
+  "move the black bowl left": [
+   "nudge the black bowl to the left side",
+   "slide the black bowl leftwards"
+  ],
+  "move the black bowl right": [
+   "nudge the black bowl to the right side",
+   "slide the black bowl rightwards"
+  ],
+  "place the black bowl on the plate": [
+   "deposit the black bowl on the plate",
+   "rest the black bowl on the plate"
+  ],
+  "release the black bowl": [
+   "unclench the gripper from the black bowl",
+   "release your grip on the black bowl"
+  ]
+ },
+ "gen_seen": {
+  "approach the black bowl": [
+   "head over to the black bowl",
+   "steer the gripper to the black bowl",
+   "draw closer to the black bowl",
+   "navigate to the black bowl",
+   "get near the black bowl",
+   "position the arm at the black bowl"
+  ],
+  "grasp the black bowl": [
+   "clutch the black bowl",
+   "grip the black bowl firmly",
+   "clamp onto the black bowl",
+   "secure the black bowl in the gripper",
+   "hold the black bowl tight",
+   "clasp the black bowl"
+  ],
+  "move the black bowl backward": [
+   "push the black bowl back",
+   "draw the black bowl backward",
+   "pull the black bowl toward the rear",
+   "relocate the black bowl backward",
+   "ease the black bowl backward",
+   "drag the black bowl backward"
+  ],
+  "move the black bowl forward": [
+   "push the black bowl ahead",
+   "draw the black bowl forward",
+   "propel the black bowl toward the front",
+   "relocate the black bowl forward",
+   "ease the black bowl forward",
+   "drag the black bowl forward"
+  ],
+  "move the black bowl left": [
+   "push the black bowl to the left",
+   "draw the black bowl leftward",
+   "steer the black bowl to the left",
+   "relocate the black bowl to the left",
+   "ease the black bowl left",
+   "drag the black bowl to the left"
+  ],
+  "move the black bowl right": [
+   "push the black bowl to the right",
+   "draw the black bowl rightward",
+   "steer the black bowl to the right",
+   "relocate the black bowl to the right",
+   "ease the black bowl right",
+   "drag the black bowl to the right"
+  ],
+  "place the black bowl on the plate": [
+   "position the black bowl on the plate",
+   "settle the black bowl onto the plate",
+   "lay the black bowl on the plate",
+   "place the black bowl down onto the plate",
+   "leave the black bowl resting on the plate",
+   "arrange the black bowl on top of the plate"
+  ],
+  "release the black bowl": [
+   "let the black bowl go",
+   "ungrip the black bowl",
+   "loosen the gripper on the black bowl",
+   "free the black bowl from the gripper",
+   "relax the gripper on the black bowl",
+   "let the black bowl out of the gripper"
+  ]
+ },
+ "hparams": {
+  "sem_av": 0.1,
+  "sem_al": 0.05,
+  "sem_vl": 0.0,
+  "temp": 0.07,
+  "bs": 256,
+  "lr": 0.001,
+  "wd": 0.0001,
+  "epochs": 200,
+  "warmup": 200,
+  "seed": 0
+ },
+ "novel3_theirs": {
+  "approach the black bowl": [
+   "close in on the black bowl",
+   "move up to the black bowl"
+  ],
+  "grasp the black bowl": [
+   "grab hold of the black bowl",
+   "take the black bowl in the gripper"
+  ],
+  "move the black bowl backward": [
+   "move the black bowl to the back",
+   "back the black bowl up"
+  ],
+  "move the black bowl forward": [
+   "move the black bowl to the front",
+   "send the black bowl forward"
+  ],
+  "move the black bowl left": [
+   "move the black bowl over to the left",
+   "send the black bowl left"
+  ],
+  "move the black bowl right": [
+   "move the black bowl over to the right",
+   "send the black bowl right"
+  ],
+  "place the black bowl on the plate": [
+   "put down the black bowl on the plate",
+   "place the black bowl atop the plate"
+  ],
+  "release the black bowl": [
+   "open the gripper to drop the black bowl",
+   "release the hold on the black bowl"
+  ]
+ }
+}
